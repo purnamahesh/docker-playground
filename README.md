@@ -28,11 +28,112 @@ Servers -> VMs -> Containers -> Docker Containers -> Web Assembly
 	- Prometheus
 	- Cilium?
 	- etc,...
-- The Moby Project?
+- The Moby Project
+
+## Big Picture
+
+#### Ops perpective
+	- start, stop, delete container, exec cmds inside
+#### Dev Perspective
+	- app side
+	- app source code, building it into image, and running
+
+## Docker Engine
+two parts:
+	- the docker daemon - monolithic binary containing all the logic of buiding images, run containers, managing volumes, plugins, etc
+		- getting slower
+		- harder to main because of being monolethic
+		- **runc**: for running containers
+		- **containerd**: for building images
+	- the LXC 
+		Linux only
+		Interacts with linux kernal for creating namesapces and cgroups
+		*docker replaces this with libcontaier to be multi-platform
+
+docker-cli -> docker daemon -> containerd -> runc & shim (parent of container ps)
+
+
+## Docker Images
+
+registory/<org|user>/repo/imagename:tag
+
+### layers - readonly
+
+digests
+
+docker buildx imagetools <image>
+
+dokcer pull registry/user|org/repo/name:digest
+
+
+- images digests are a crypto hash of the imag's manifest file
+- layer digests are a crypto hash of the layer contents
+
+content hashes vs distribution hashes
+- content hash: uncompressed
+- distribution hash: compressed for storage in registory
+
+### Multi-architecure images | Platforms
+- manifest lists: list of architectures supported by the image tag
+	- each supported architecture has it own manifest file
+
+docker buildx imagetools inspect <image>
+
+docker manifest inspect <image>
+
+using docker buildx we can build images of different architecture from any architecture machine
+Two ways to achieve this:
+	- Emulation (uses QEMU VM - works most of the time but slow and dont have shared cache)
+	- Build cloud (subscription sevice by Docker Inc builds in the target architecture in the cloud)
+		- integrates well with Docker Desktop and Github Actions
+		- Teammates can use shared cache
+
+
+### Vulnerability Scaning with Docker Scout (paid service)
+scout.docker.com
+
+install docker scout plugin
+```bash
+curl -sSfL https://raw.githubusercontent.com/docker/scout-cli/main/install.sh | sh -s --
+```
+
+docker scout quickview <image>
+
+docker scout cves <image>
+
+### delete docker images
+
+docker rmi <image|short id|name|SHA>
+
+deletes image from local. But keeps the layer cache.
+docker prevents deleting when image is being used by any container
+
+you can use `**-f**` flag to force delete the image even a container is running, but this will untag the container from the image and becomes a **dangling contianer**
+
+
+## Docker Containers
+
+Container are runtime instances of images. We can start/stop a container from an image.
+
+- Images are read-only but conatiners are writable 
+- Containers are statless and ephimeral while VMs are stateful and resumes where they are stopped
+- Containers are meant to be immutable - mwans if one fails we shouuld create another in its place instead of connecting to it and making a live fix
+- Containers should only run one process and we use them to build microservices
+
+Containers vs VMs
+- VMs virtualize the hardware
+- Containers virtualize the OS
+
+
+Images are read-only.
+But images will creating a Read-write layer of the containers. Id an image update layer it'll ne stored by docker even the container is stopped and restored the changes will be there. These will be sropped once the container is deleted.:w
+
 
 
 # Books
 Quick Start Kubernetes
 The Kubernetes Book 
 
-# till page 35
+
+
+# till page 131
