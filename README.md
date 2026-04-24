@@ -77,6 +77,8 @@ content hashes vs distribution hashes
 - manifest lists: list of architectures supported by the image tag
 	- each supported architecture has it own manifest file
 
+docker inspect <image>
+
 docker buildx imagetools inspect <image>
 
 docker manifest inspect <image>
@@ -128,6 +130,43 @@ Containers vs VMs
 Images are read-only.
 But images will creating a Read-write layer of the containers. Id an image update layer it'll ne stored by docker even the container is stopped and restored the changes will be there. These will be sropped once the container is deleted.:w
 
+CMD & Entrpoint
+
+### Connecting to containers
+	- interactive
+		- Connect to shell
+		- docker exec -it webserver sh
+	- remote-execution
+		- Send commands to running container
+		- docker exec webserver ps
+
+
+`docker inspect <container name|id>`
+
+### Docker debug
+To shell into distroless / slim images
+- changes made while debugging a live ccontainer are persisted
+- changes made while debugging images / stopped contaienrs are not persisted
+
+
+## Self-healing containers (restart policies)
+
+apply restart policies per containers.
+
+Docker supports four restart policies:
+- no (default)
+- no-failure
+- always
+- unless-stopped
+
+|Restart Policy|Non-zero exit code|Zero exit code|Docker stop command|restart when daemon restarts|
+|no|N|N|N|N|
+|on-failure|Y|N|N|Y|
+|always|Y|Y|Y|Y|
+|unless-stopped|Y|Y|N|N|
+
+
+
 
 
 # Books
@@ -136,4 +175,4 @@ The Kubernetes Book
 
 
 
-# till page 131
+# till page 157
