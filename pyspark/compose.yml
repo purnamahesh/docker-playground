@@ -1,0 +1,36 @@
+services:
+  spark-master:
+    build: .
+    hostname: spark-master
+    container_name: spark-master
+    volumes:
+      - ./data:/opt/spark/data
+    ports:
+      - 8080:8080
+      - 7077:7077
+    command: 
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+    networks:
+      - spark-network
+  
+  spark-worker:
+    build: .
+    hostname: spark-worker
+    volumes:
+      - ./data:/opt/spark/data
+    networks:
+      - spark-network
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+    environment:
+      - SPARK_EXECUTOR_CORES=2
+      - SPARK_EXECUTOR_MEMORY=2g
+    depends_on:
+      - spark-master
+
+networks:
+  spark-network:
+    driver: bridge
