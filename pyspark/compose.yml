@@ -26,8 +26,8 @@ services:
       - org.apache.spark.deploy.worker.Worker
       - spark://spark-master:7077
     environment:
-      - SPARK_EXECUTOR_CORES=2
-      - SPARK_EXECUTOR_MEMORY=2g
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=2g
     depends_on:
       - spark-master
 
