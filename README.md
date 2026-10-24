@@ -5,6 +5,8 @@
 WHat is WebAssembly?
 WebGPU?
 containerd
+LABEL, ONBUILD, HEALTHCHECK
+
 
 Servers -> VMs -> Containers -> Docker Containers -> Web Assembly
 
@@ -160,10 +162,51 @@ Docker supports four restart policies:
 - unless-stopped
 
 |Restart Policy|Non-zero exit code|Zero exit code|Docker stop command|restart when daemon restarts|
+|--------------|------------------|--------------|-------------------|----------------------------|
 |no|N|N|N|N|
 |on-failure|Y|N|N|Y|
 |always|Y|Y|Y|Y|
 |unless-stopped|Y|Y|N|N|
+
+
+# Containerizing an App
+
+- Instructions that add context like files, etc will create new layers (FROM, RUN, COPY, WORKDIR)
+
+`docker build -t <tag> .`
+
+`docker tag <old tag> <newtag>`
+
+`docker history <image>`   -- to see instructions that created the image
+
+## Multi stage builds - for production
+
+- big means slow
+- big means more vulnarabilities
+- big means larger attach surface
+
+`docker build -t multi:client --target prod-client -f Dockerfile`
+
+
+`docker build -t multi:server --target prod-server -f Dockerfile`
+
+# Buildx, BuildKit, drivers and Build Cloud
+
+
+Docker build sytem has a client and server:
+- Client: Buildx
+- Server: BuildKit
+
+`docker buildx ls --no-trunc`Goal: Implement LRU eviction with a max-capacity cache. Confront the hardest ownership challenge: a data structure with multiple access paths to the same data.
+
+** Ensure instructions that are most likely to invalidate the cache should be at the bottomi
+
+`--no-cache`
+
+# Docker Compose
+
+to manage Multi container apps
+
 
 
 
@@ -175,4 +218,4 @@ The Kubernetes Book
 
 
 
-# till page 157
+#till page 216
