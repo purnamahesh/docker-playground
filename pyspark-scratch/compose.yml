@@ -28,7 +28,7 @@ services:
       # - SPARK_EXECUTOR_CORES=2
       # - SPARK_EXECUTOR_MEMORY=2g
     volumes:
-      - ./work_dir:/opt/spark/work_dir
+      - ./work_dir:/home/ubuntu/work_dir
     depends_on:
       - spark-master
     networks:
