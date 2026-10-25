@@ -32,6 +32,23 @@ services:
       - spark-network
     depends_on:
       - spark-master
-
+  
+  jupyter:
+    build: .
+    container_name: jupyter
+    hostname: jupyter
+    command: >
+      jupyter lab --ip=0.0.0.0 --port=8888 --no-browser
+      --notebook-dir=/home/icarus/work_dir
+      --IdentityProvider.token=''
+    ports:
+      - 8888:8888
+      - 4040:4040
+    volumes:
+      - ./work_dir:/home/icarus/work_dir
+    networks:
+      - spark-network
+    depends_on:
+      - spark-master
 networks:
   spark-network:
