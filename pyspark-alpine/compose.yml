@@ -1,0 +1,37 @@
+
+services:
+  spark-master:
+    build: .
+    container_name: spark-master
+    hostname: spark-master
+    ports:
+      - 8080:8080
+      - 7077:7077
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+    volumes:
+      - ./work_dir:/home/icarus/work_dir
+    networks:
+      - spark-network
+  
+  spark-worker:
+    build: .
+    hostname: spark-worker
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+    volumes:
+      - ./work_dir:/home/icarus/work_dir
+    environment:
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_DIR=/tmp/spark-work
+      - SPARK_WORKER_MEMORY=2g
+    networks:
+      - spark-network
+    depends_on:
+      - spark-master
+
+networks:
+  spark-network:
