@@ -172,13 +172,13 @@ Hadoop and S3A settings passed through Spark need the `spark.hadoop.` prefix. Wo
 
 **Postgres-side settings to know:** maximum connections, shared buffers, work memory, slow-query logging, query statistics extension, and the WAL level (must be raised for any log-based CDC).
 
-## 14. Object storage (S3A and MinIO)
+## 14. Object storage (S3A and RustFS)
 
 All set via the `spark.hadoop.` prefix.
 
 | Setting | Meaning | Where |
 |---|---|---|
-| ★ endpoint, path-style access, SSL flag, access key, secret key | required for MinIO | setup |
+| ★ endpoint, path-style access, SSL flag, access key, secret key | required for RustFS | setup |
 | ★ connection pool maximum (`fs.s3a.connection.maximum`) | concurrent HTTP connections | P4 |
 | `fs.s3a.threads.max` | worker threads for transfers | P4 |
 | `fs.s3a.fast.upload` and buffer mode (disk, array, bytebuffer) | upload buffering | P4 |
@@ -198,6 +198,7 @@ All set via the `spark.hadoop.` prefix.
 | ★ `spark.sql.catalog.<name>` and its type/implementation, warehouse, uri, file I/O implementation | defines the catalog | setup |
 | `spark.sql.defaultCatalog` | default catalog for unqualified names | setup |
 | JDBC catalog connection settings | where catalog metadata lives | setup |
+| REST catalog URI, warehouse name, request-signing settings (RustFS S3 Tables preview or a standalone REST service) | alternative catalog; both the catalog calls and the S3 file access need credentials, region and path-style access | P4 |
 
 ### Table properties (set at creation or by ALTER)
 
@@ -244,7 +245,7 @@ All set via the `spark.hadoop.` prefix.
 
 | Config | Default | Meaning |
 |---|---|---|
-| ★ `spark.eventLog.enabled` / `spark.eventLog.dir` | false | write logs for the history server (can point at a MinIO bucket) |
+| ★ `spark.eventLog.enabled` / `spark.eventLog.dir` | false | write logs for the history server (can point at a RustFS bucket) |
 | `spark.history.fs.logDirectory` | n/a | history server input |
 | `spark.ui.port` | 4040 | live UI port |
 
@@ -257,7 +258,7 @@ For each ★ setting, write a card after one experiment, with these lines:
 - **Setting and default**
 - **What it controls**
 - **Too low / too high**
-- **How I observed it** (which UI, which metadata table, which MinIO or Postgres metric)
+- **How I observed it** (which UI, which metadata table, which RustFS or Postgres metric)
 - **Value I chose and why**
 - **Interacts with** (the settings that change its effect)
 
@@ -277,4 +278,4 @@ For each ★ setting, write a card after one experiment, with these lines:
 
 ### The rule behind most tuning
 
-Before touching a setting, name the bottleneck from the UIs: **skew** (uneven tasks), **spill** (memory), **too many or too small tasks** (partitions), **too much shuffle** (plan), **GC**, **Python overhead**, **object-store throughput** (MinIO), **source database load** (Postgres), or **commit conflicts** (Iceberg). Then change the setting that targets that bottleneck. Changing settings without a diagnosis is how clusters collect cargo-cult configuration.
+Before touching a setting, name the bottleneck from the UIs: **skew** (uneven tasks), **spill** (memory), **too many or too small tasks** (partitions), **too much shuffle** (plan), **GC**, **Python overhead**, **object-store throughput** (RustFS), **source database load** (Postgres), or **commit conflicts** (Iceberg). Then change the setting that targets that bottleneck. Changing settings without a diagnosis is how clusters collect cargo-cult configuration.

@@ -2,25 +2,25 @@
 
 ## Goal
 
-Build a near-real-time pipeline: **clickstream files in MinIO** and **row changes from Postgres** flow through Structured Streaming into Iceberg bronze, silver and gold, with windows, sessions, CDC apply, deduplication, failure recovery, and ongoing table maintenance.
+Build a near-real-time pipeline: **clickstream files in RustFS** and **row changes from Postgres** flow through Structured Streaming into Iceberg bronze, silver and gold, with windows, sessions, CDC apply, deduplication, failure recovery, and ongoing table maintenance.
 
 ## Concepts covered
 
-Triggers, checkpoints (stored in MinIO), event time vs processing time, watermarks, output modes, windowed and session aggregates, state stores, deduplication, stream-static and stream-stream joins, `foreachBatch` with MERGE for CDC, ordering and idempotency, Iceberg as streaming sink and source, small files and snapshot growth, concurrent maintenance, end-to-end latency.
+Triggers, checkpoints (stored in RustFS), event time vs processing time, watermarks, output modes, windowed and session aggregates, state stores, deduplication, stream-static and stream-stream joins, `foreachBatch` with MERGE for CDC, ordering and idempotency, Iceberg as streaming sink and source, small files and snapshot growth, concurrent maintenance, end-to-end latency.
 
 ## Sources
 
 | Source | How it arrives |
 |---|---|
-| Clickstream | JSON objects written continuously to the MinIO `landing` bucket, with out-of-order events, 2% very late events, duplicates and replays |
-| Postgres changes | the trigger-filled `change_log` table (operation, key, before/after image, sequence, changed_at), polled in micro-batches |
+| Clickstream | JSON objects written continuously to the RustFS `landing` bucket, generated around real Instacart baskets (cart-add events in the real `add_to_cart_order` sequence, searches and views, plus sessions that never convert), with out-of-order events, 2% very late events, duplicates and replays |
+| Postgres changes | the **lifecycle replay** of Instacart orders on the rebuilt timeline (placed, accepted, picking, item substitutions and removals, delivered or cancelled, plus membership-tier changes and privacy erasures) captured by the trigger-filled `change_log` table (operation, key, before/after image, sequence, changed_at), polled in micro-batches |
 | Stretch | real log-based CDC through a connector and a message broker |
 
 ## Milestones
 
 ### M1. Clickstream into bronze
 
-- Read the landing bucket as a file stream with an explicit schema and a files-per-trigger cap. Write to an Iceberg bronze table with the checkpoint in MinIO.
+- Read the landing bucket as a file stream with an explicit schema and a files-per-trigger cap. Write to an Iceberg bronze table with the checkpoint in RustFS.
 - Compare triggers: fixed interval, available-now, once.
 - Inspect the checkpoint directory (offsets, commits, sources, state) and relate each file to a concept.
 - Observe **listing cost** on an object store as the landing bucket grows. Test the file source's cleanup options (archive vs delete) and the effect on listing time.
@@ -77,7 +77,7 @@ Do each deliberately and record the behavior:
 |---|---|
 | Kill a worker | executor loss, retries, no data loss |
 | Stop the notebook kernel (driver dies) | restart from checkpoint, exact resume |
-| Stop MinIO during a batch | error, retry, state of checkpoint and table |
+| Stop RustFS during a batch | error, retry, state of checkpoint and table |
 | Stop Postgres during CDC polling | does the job resume without gaps or duplicates? |
 | Add a column to the sink table while the stream runs | does the stream continue? |
 | Change the aggregation key or output mode | which errors appear? |
@@ -98,7 +98,7 @@ Do each deliberately and record the behavior:
 | Shuffle partitions | 8, 16, 32 | batch time, state layout |
 | State store provider | default vs RocksDB | memory, latency |
 | Iceberg sink | fanout, target file size, distribution | small files |
-| Checkpoint location | MinIO vs shared volume | commit latency |
+| Checkpoint location | RustFS vs shared volume | commit latency |
 
 ## Stretch goals
 

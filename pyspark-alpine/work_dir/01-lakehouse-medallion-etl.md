@@ -1,76 +1,99 @@
-# Project 1: Lakehouse Medallion ETL
+# Project 1: Lakehouse Medallion ETL (Instacart)
 
 ## Goal
 
-Build an idempotent, incremental pipeline from **PostgreSQL and clickstream files** through **MinIO landing** into **Iceberg bronze, silver and gold** tables, with data quality handling, time travel, schema and partition evolution, and table maintenance.
+Profile and load the **Instacart** data into Postgres as an operational model, extract it with Spark into **RustFS landing**, and build **Iceberg bronze, silver and gold** tables with data quality handling, incremental loads, time travel, evolution and maintenance.
 
 ## Concepts covered
 
-JDBC parallel reads, full vs incremental extraction, raw landing zones, Iceberg table design (partition transforms, file format, target file size), MERGE INTO, SCD Type 2, soft and hard deletes, ANSI mode and `try_*` functions, write-audit-publish with branches/tags, time travel, schema and partition evolution, compaction, snapshot expiry, orphan cleanup, reconciliation.
+Profiling a large real source, constraint staging, enriching a source with synthetic operational data, JDBC parallel reads at 34M rows, full vs incremental extraction, raw landing zones, Iceberg table design, MERGE INTO, SCD Type 2, delete handling, ANSI mode and `try_*` functions, window functions over user history, write-audit-publish, time travel, schema and partition evolution, compaction, snapshot expiry, orphan cleanup, reconciliation.
 
 ## Sources and targets
 
 | Layer | Location | Format | Notes |
 |---|---|---|---|
-| Source 1 | Postgres OLTP | rows | customers, products, orders, order_items, payments |
-| Source 2 | MinIO `landing` clickstream | JSON files | dirty, duplicated, late |
-| Landing | MinIO `landing` | Parquet/CSV/JSON | raw extracts plus extract metadata |
+| Source 1 | Postgres OLTP | rows | the Instacart tables plus synthetic users, stores, prices, payments, lifecycle |
+| Source 2 | RustFS `landing` clickstream | JSON files | built around real baskets; dirty, duplicated, late |
+| Landing | RustFS `landing` | Parquet/CSV/JSON | raw extracts plus extract metadata |
 | Bronze | Iceberg `bronze.*` | Iceberg/Parquet | append-only, faithful, with lineage |
-| Silver | Iceberg `silver.*` | Iceberg/Parquet | current-state tables, quarantine, SCD2 |
-| Gold | Iceberg `gold.*` | Iceberg/Parquet | marts for analytics |
+| Silver | Iceberg `silver.*` | Iceberg/Parquet | current state, quarantine, SCD2, conformed dimensions |
+| Gold | Iceberg `gold.*` | Iceberg/Parquet | analytics marts |
 
 ## Milestones
 
+### M0. Load, profile and constrain the source
+
+- Download the Instacart files. Load each into a Postgres **staging schema as text**, then into typed tables. Bulk-load first and build indexes afterwards; compare load times.
+- Parse `products` with care (commas and quotes in names). Compare a naive loader with a proper CSV parser.
+- **Profile every table:** row counts, null rates, distinct counts, duplicate keys, value ranges. Write each defect into the **defect register**. Include: test orders with no lines, the null and capped `days_since_prior_order`, the placeholder aisle and department, basket-size distribution, products that never sell.
+- **Union the two order-line files** into one `order_items` table and keep the source file as a column. Decide how test-set orders (no lines) are modeled.
+- Add constraints in stages and see which relationships hold: primary keys (orders; the composite `order_id` + `product_id` on lines), foreign keys from lines to orders and products, products to aisles and departments. Failures are **findings**, not errors.
+- **Verify the `reordered` flag** against each user's history. How many rows disagree?
+- Build the **rebuilt timeline**: turn gaps, hours and weekdays into timestamps. Report how often the weekday doesn't fit.
+- Add the synthetic operational tables from the README (users, stores, price book, order totals and payments, lifecycle). Document each generation rule.
+- Add OLTP columns (`updated_at`, `is_deleted`), indexes (PK, FK, `updated_at`), and **leave one useful index out on purpose** (for example on the order timestamp).
+- Build the S, M and L tiers. Which defect rates stayed constant?
+
 ### M1. Full-snapshot extraction over JDBC
 
-- Read each Postgres table in parallel. Decide the **partition column** (numeric or date, indexed, evenly distributed), its bounds (from a min/max query), and the partition count.
-- Compare these on a large table: single partition vs several `numPartitions` values; different `fetchsize` values; the `dbtable` option vs a `query` with a subquery; explicit predicates per partition.
-- Land the extract in MinIO as Parquet with extract metadata (extract id, extracted_at, source table, row count). Compare Parquet vs CSV vs JSON for size and time.
-- **Observe in Postgres:** number of active connections during the extract, the queries Spark sent, whether they used index scans or sequential scans, and the effect of the **missing index** you left on purpose.
-- Skew trap: partition on a column that is not evenly spread (for example, by `customer_id` ranges with a hot customer). Which JDBC task runs longest and why?
+- Read each table in parallel. Decide the partition strategy:
+  - `orders`: numeric `order_id`; check that ids are evenly spread before assuming a range split is balanced.
+  - `order_items` (34M rows): partition on `order_id` ranges, and compare with partitioning on a hash expression and on explicit predicates. Large baskets make equal id ranges carry **unequal row counts**. Measure the imbalance.
+  - small dimensions: a single read.
+- Compare on the large table: single partition vs several `numPartitions` values; different `fetchsize` values; the table option vs a query with a subquery.
+- Land the extract as Parquet in RustFS with extract metadata (extract id, extracted_at, source table, row count). Compare Parquet, CSV and JSON for size and time.
+- **Observe in Postgres:** active connections, the exact queries Spark sent, index vs sequential scans, and the effect of the missing index.
+- Skew trap: partition on a column with uneven values (for example the hour of day or the department). Which JDBC task is slowest and why?
 
 ### M2. Incremental extraction
 
-- Design a high-watermark extraction on `updated_at`. Decide where the watermark state lives (a control table in Postgres or Iceberg) and how a failed run is retried idempotently.
-- Handle the traps: late updates to old rows, identical timestamps (ties), clock skew (use an overlap window and dedupe), and hard deletes that a watermark can never see.
-- Add a periodic **full key reconciliation** to detect deletes, and document its cost.
-- Compare against the change-log table (preview of Project 5): what does each approach catch and miss?
+- Design a high-watermark extraction on `updated_at`, driven by the **lifecycle replay**. Decide where the watermark state lives and how a failed run is retried idempotently.
+- Handle the traps: late status updates, identical timestamps (ties), item substitutions that arrive after the order is delivered, clock skew (use an overlap window and dedupe), and **hard deletes** (privacy erasures) a watermark can never see.
+- Add a periodic **full key reconciliation** to detect deletes and document its cost.
+- Compare with the change-log table (preview of Project 5): what does each approach catch and miss?
 
 ### M3. Bronze tables in Iceberg
 
-- Create bronze tables as append-only, with lineage columns (extract id, source system, ingested_at, source file).
-- Choose table properties deliberately: format version, Parquet compression, target file size. Compare at least two compression codecs.
-- Try three partition designs for the large table: daily on the load timestamp, hourly, and a bucket transform on the key. Predict the file counts first.
-- After each write, inspect the Iceberg metadata tables (snapshots, files, manifests, partitions) and correlate them with the objects visible in the MinIO console.
-- Bring in the clickstream: read JSON with an explicit schema vs an inferred one (note the extra scan), capture corrupt records, and write to a bronze events table.
+- Create bronze tables append-only, with lineage columns (extract id, source system, ingested_at, source file).
+- Choose properties deliberately: format version, Parquet compression, target file size. Compare two compression codecs.
+- Try three partition designs for `order_items` (34M rows): by month of the rebuilt order date, by a bucket transform on `order_id`, and by department. Predict the file counts first.
+- After each write, inspect the Iceberg metadata tables and correlate them with the objects in the RustFS console.
+- Clickstream: read JSON with an explicit schema vs an inferred one (note the extra scan), capture corrupt records, handle the schema drift you built in, write to a bronze events table.
 
-### M4. Silver: MERGE, SCD2, quality
+### M4. Silver: conform, dedupe, quarantine
 
-- **Current-state tables:** MERGE the latest change per key into silver using `updated_at` (and sequence when available). Deduplicate deterministically.
-- **Deletes:** apply soft deletes as flags and hard deletes from reconciliation.
-- **Copy-on-write vs merge-on-read:** switch the merge/update/delete modes. Measure write time, read time, and the extra delete files produced. When does each win?
-- **SCD Type 2** for `customers` (valid_from, valid_to, is_current) using MERGE. Verify with an as-of query for a past date.
-- **Quality:** with ANSI mode on, use `try_*` casts and route failures to a `silver.quarantine_*` table with a reason code. Add checks for nulls, ranges, referential integrity, and duplicate payments.
-- Clickstream silver: deduplicate by event id, handle late events, quarantine malformed ones.
+- **Order lines:** union prior and train lines (already unioned in M0); deduplicate; validate `add_to_cart_order` as a gap-free sequence per order and flag exceptions.
+- **Orders:** validate the user history (`order_number` sequence, no gaps, no duplicates), route violations to `silver.quarantine_orders` with a reason code, and keep the raw `eval_set`.
+- **Products and taxonomy:** conform the three-level taxonomy. Replace the placeholder "missing" aisle and department with an explicit unknown value, and normalize product names.
+- **Users:** build the user dimension from the synthetic users table. Track the membership tier over time as **SCD Type 2** with MERGE (valid_from, valid_to, is_current). Verify with an as-of query.
+- **Prices:** build an effective-dated price table and price each order line using the price valid at the order timestamp. Compare doing this with a range join vs an expanded daily price table.
+- **Payments:** reconcile payments against priced lines plus fees and tip. Classify mismatches (rounding, refunds, failed tenders).
+- **Reorder flag:** rebuild `reordered` from each user's history with a window or a self-join, and compare it with the source flag. Quarantine disagreements.
+- **Current state via MERGE** from bronze changes, using `updated_at` and sequence. Apply soft deletes as flags and hard deletes from reconciliation.
+- **Copy-on-write vs merge-on-read:** switch the merge/update/delete modes. Measure write time, read time and extra delete files.
+- With ANSI mode on, use `try_*` casts. Every rejected row goes to quarantine with a reason.
 
 ### M5. Gold marts
 
-Build these and record the plan and runtime for each:
+Build these and record plan and runtime for each:
 
-1. Daily revenue by country and category.
-2. Customer 360 (lifetime value, last order, recency/frequency/monetary).
-3. Funnel conversion (view, cart, purchase) per day, comparing exact and approximate distinct counts.
-4. Cohort retention by signup month.
-5. Top 10 products per category per month.
+1. Reorder rate by product, aisle and department.
+2. Basket analytics: items per order distribution, department mix per order, add-to-cart position vs reorder probability.
+3. Order cadence: gap between orders by user, hour-by-weekday order heatmap.
+4. User 360: order count, recency/frequency/monetary on priced orders, favorite products, department mix vector.
+5. Cohorts: retention by first-order month and by order number.
+6. Top-N products per department per month.
+7. **Product co-occurrence** (pairs bought together): the expensive one. Record the row count before and after the pair join, and revisit it in Project 2.
+8. Next-basket features: each user's last N orders (window), plus recently bought products not yet re-bought.
 
-Materialize them with partitioning by date and a bucket on customer where useful. Compare three rewrite strategies for a reprocessed day: dynamic partition overwrite, MERGE, and delete+insert. Prove each is **idempotent** by running twice and diffing.
+Materialize with partitioning by date and a bucket on a key where useful. Compare three rewrite strategies for a reprocessed day: dynamic partition overwrite, MERGE, delete+insert. Prove each is **idempotent** by running twice and diffing.
 
 ### M6. Time travel, evolution and write-audit-publish
 
-- Query a past snapshot by id and by timestamp. Roll a table back after a deliberately bad load.
-- Evolve the schema: add, rename, drop a column; promote a type. Confirm old files are untouched and old snapshots still read correctly.
-- **Partition evolution:** change a table from daily to hourly partitioning. Confirm existing data is not rewritten, and look at plans that scan both specs.
-- **Branches and tags:** load into a staging branch, run quality checks, then fast-forward/publish to main. Tag month-end snapshots for audits.
+- Query past snapshots by id and timestamp. Roll back a table after a deliberately bad load (for example, a wrong price-book version).
+- Evolve the schema: add, rename, drop a column; promote a type. Confirm old files are untouched.
+- **Partition evolution:** change a table from monthly to daily partitioning. Confirm existing data isn't rewritten and look at plans scanning both specs.
+- **Branches and tags:** load into a staging branch, run quality checks, publish to main. Tag month-end snapshots.
 
 ### M7. Table maintenance
 
@@ -86,30 +109,30 @@ Create a deliberate small-file mess (many tiny appends), then measure scan time 
 
 ### M8. Orchestration, failures and reconciliation
 
-- Define the run order and dependencies, then re-run one day end to end.
-- **Inject failures:** kill a worker mid-write; stop MinIO mid-commit; stop Postgres mid-extract. For each, verify that readers never see a partial table, and record what leftover files remain.
-- Produce a **reconciliation report** comparing counts and checksums across Postgres, landing, bronze, silver and gold, explaining every legitimate difference (filtered, quarantined, deleted).
+- Define run order and dependencies, then re-run one day end to end.
+- **Inject failures:** kill a worker mid-write; stop RustFS mid-commit; stop Postgres mid-extract. For each, verify that readers never see a partial table and record leftover files.
+- Produce a **reconciliation report** across the raw files, Postgres, landing, bronze, silver and gold, explaining every legitimate difference (filtered, quarantined, deleted, deduplicated). Tie each difference to a defect-register entry.
 
 ## Config and property experiments
 
 | Area | Knobs |
 |---|---|
-| JDBC | `numPartitions`, `fetchsize`, partition column and bounds, pushdown options |
-| Spark | `spark.sql.shuffle.partitions`, AQE, `spark.sql.sources.partitionOverwriteMode` |
-| Iceberg write | target file size, distribution mode, compression codec, merge/update/delete mode |
+| JDBC | `numPartitions`, `fetchsize`, partition strategy, pushdown options |
+| Spark | shuffle partitions, AQE, `spark.sql.sources.partitionOverwriteMode` |
+| Iceberg write | target file size, distribution mode, compression, merge/update/delete mode |
 | Iceberg layout | partition transforms, sort order, format version |
-| Storage | S3A or S3 file I/O connection settings (details in Project 4) |
+| Storage | S3A or Iceberg S3 file I/O settings against RustFS (Project 4) |
 
 ## Stretch goals
 
 - Move the catalog from JDBC to a REST catalog and note what changes.
 - Package the pipeline as a parameterized application and run it with `spark-submit` in client mode; try cluster mode and see what standalone allows for Python apps.
-- Add a reverse-ETL step that writes a gold aggregate back to a Postgres reporting table with controlled parallelism.
+- Add a reverse-ETL step writing a gold aggregate back to a Postgres reporting table with controlled parallelism.
 
 ## Done when you can answer
 
-1. Why can a high-watermark extract miss data, and which three mitigations did you use?
-2. When is merge-on-read better than copy-on-write, and what does it cost readers?
-3. What does partition evolution change in the metadata, and what does it leave untouched?
-4. Which maintenance step improved performance most, and which reduced storage?
+1. Which Instacart defects did you find, and which rule handled each?
+2. Why do test-set orders have no lines, and how did you model them?
+3. Why can equal id ranges give very unequal JDBC partitions here?
+4. When is merge-on-read better than copy-on-write, and what does it cost readers?
 5. Why can readers never see half a write, even when you killed a worker mid-commit?

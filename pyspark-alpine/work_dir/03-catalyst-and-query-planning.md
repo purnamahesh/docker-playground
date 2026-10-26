@@ -2,7 +2,7 @@
 
 ## Goal
 
-Become fluent at reading Spark plans and predicting what the optimizer will do, across **three kinds of scan**: Iceberg tables, JDBC tables, and raw files in MinIO. Prove every prediction with measurements from Spark, Iceberg metadata, MinIO and Postgres.
+Become fluent at reading Spark plans and predicting what the optimizer will do, across **three kinds of scan**: Iceberg tables, JDBC tables, and raw files in RustFS. Prove every prediction with measurements from Spark, Iceberg metadata, RustFS and Postgres.
 
 ## Concepts covered
 
@@ -10,7 +10,7 @@ Logical vs physical plans, rule-based optimization, column pruning, predicate pu
 
 ## Data
 
-Silver and gold tables from Project 1, the clickstream events table, the live Postgres dimensions, and raw Parquet extracts in the landing bucket for comparison. Make sure at least one large Iceberg table exists in three variants: unsorted, sorted by a filter column, and z-ordered on two columns.
+The Instacart silver and gold tables from Project 1 (orders, order lines, products, aisles, departments, users, stores, price book, payments), the clickstream events table, the live Postgres dimensions, and raw Parquet extracts in the landing bucket for comparison. Make sure at least one large Iceberg table (for example `order_items`, about 34M rows, or the events table) exists in three variants: unsorted, sorted by a filter column (such as product id or order date), and z-ordered on two columns (such as department and order hour).
 
 ## Milestones
 
@@ -20,7 +20,7 @@ Silver and gold tables from Project 1, the clickstream events table, the live Po
 - Find these in plans: constant folding, column pruning, predicate pushdown through a join, limit pushdown.
 - Learn every field on a scan node: what was pushed, what was read, what was left for Spark to filter.
 - Turn off a single optimizer rule on a tiny sample and see the plan change. Don't try this at scale.
-- Do this for three scan types and write one paragraph on how each looks different in the plan: Iceberg, JDBC, raw Parquet in MinIO.
+- Do this for three scan types and write one paragraph on how each looks different in the plan: Iceberg, JDBC, raw Parquet in RustFS.
 
 ### M2. Iceberg pruning (the metadata is the index)
 
@@ -83,6 +83,10 @@ Pitfall gallery (before and after plans for each):
 | Cached table hides the scan | cache the narrowed data only |
 | Wide select into a wide join | project early |
 | Many small files or many manifests | compact and rewrite manifests |
+| Self-join of order lines on order id for co-occurrence (pair explosion) | prune to frequent products and cap huge baskets before pairing |
+| Filter on the order timestamp in Postgres without an index | add the index or push the work into the lake |
+| Join on a normalized product name (expression on the join key) | normalize once in silver and join on the stored key |
+| Range join of lines to the effective-dated price book | expand prices to daily rows and equi-join |
 
 Layout experiments, each measured by bytes read and time:
 
