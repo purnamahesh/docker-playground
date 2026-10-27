@@ -8,8 +8,6 @@ CREATE TABLE department (
     department VARCHAR(100) NOT NULL
 );
 
-
-
 COPY aisle(id, aisle)
 FROM '/tmp/InstaCart/aisles.csv'
 DELIMITER ','
