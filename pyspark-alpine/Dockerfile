@@ -17,20 +17,21 @@ RUN tar -xzf spark-${SPARK_VERSION}-bin-hadoop3.tgz \
     && mv spark-${SPARK_VERSION}-bin-hadoop3 spark
 
 ENV SPARK_HOME=/opt/spark
-ENV PYSPARK_PYTHON=python
-ENV PATH="/opt/venv/bin:${SPARK_HOME}/bin:${SPARK_HOME}/sbin:${PATH}"
-
 RUN ln -s ${SPARK_HOME}/python/lib/py4j-*-src.zip ${SPARK_HOME}/python/lib/py4j-src.zip
-
 ENV PYTHONPATH="${SPARK_HOME}/python:${SPARK_HOME}/python/lib/pyspark.zip:${SPARK_HOME}/python/lib/py4j-src.zip"
+
+RUN python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir jupyterlab
 
 RUN adduser -D -s /bin/bash icarus \
     && echo 'icarus ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/icarus \
-    && chmod 0440 /etc/sudoers.d/icarus
+    && chmod 0440 /etc/sudoers.d/icarus \
+    && chown -R icarus:icarus /opt/venv \
+    && chown -R icarus:icarus /opt/spark
 
-RUN python3 -m venv /opt/venv \
-    && /opt/venv/bin/pip install --no-cache-dir jupyterlab \
-    && chown -R icarus:icarus /opt/venv
+
+ENV PYSPARK_PYTHON=python
+ENV PATH="/opt/venv/bin:${SPARK_HOME}/bin:${SPARK_HOME}/sbin:${PATH}"
 
 USER icarus
 

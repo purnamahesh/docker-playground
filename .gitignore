@@ -1,3 +1,6 @@
 *.tgz
+*.zip
+*.csv
 .Trash*
 .ipynb_checkpoints
+spark-events
