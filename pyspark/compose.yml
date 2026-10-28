@@ -6,8 +6,8 @@ services:
       - 9000:9000
       - 9001:9001
     volumes:
-      - ./work_dir/rustfs-data:/data
-      - ./work_dir/rustfs-logs:/logs
+      - ./rustfs-data:/data
+      - ./rustfs-logs:/logs
     environment:
       - RUSTFS_ACCESS_KEY=admin
       - RUSTFS_SECRET_KEY=admin
