@@ -1,19 +1,22 @@
 
 services:
-  # instacart:
-  #   image: postgres:16
-  #   container_name: instacart
-  #   restart: always
-  #   environment:
-  #     POSTGRES_USER: admin
-  #     POSTGRES_PASSWORD: admin
-  #     POSTGRES_DB: instacart
-  #   ports:
-  #     - "5432:5432"
-  #   volumes:
-  #     - ./data/pgdata:/var/lib/postgresql/data
-  #     - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
-  #     - ./data/InstaCart:/tmp/InstaCart
+  instacart:
+    image: postgres:16
+    container_name: instacart
+    hostname: instacart
+    restart: always
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+      POSTGRES_DB: instacart
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./work_dir/data/pgdata:/var/lib/postgresql/data
+      - ./work_dir/sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./work_dir/data/InstaCart:/tmp/InstaCart
+    networks:
+      - spark-network
     
   spark-master:
     build: .

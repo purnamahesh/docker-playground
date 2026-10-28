@@ -4,3 +4,4 @@
 .Trash*
 .ipynb_checkpoints
 spark-events
+pgdata/
