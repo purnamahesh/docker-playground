@@ -2,137 +2,334 @@
 
 ## Goal
 
-Profile and load the **Instacart** data into Postgres as an operational model, extract it with Spark into **RustFS landing**, and build **Iceberg bronze, silver and gold** tables with data quality handling, incremental loads, time travel, evolution and maintenance.
+Turn the raw Instacart files into a governed lakehouse: profile and enrich them into an operational model in Postgres, extract them with Spark into RustFS landing, and build Iceberg bronze, silver and gold layers with data quality handling, incremental loads, time travel, evolution, maintenance and reconciliation.
 
-## Concepts covered
+## Work plan (what happens when)
 
-Profiling a large real source, constraint staging, enriching a source with synthetic operational data, JDBC parallel reads at 34M rows, full vs incremental extraction, raw landing zones, Iceberg table design, MERGE INTO, SCD Type 2, delete handling, ANSI mode and `try_*` functions, window functions over user history, write-audit-publish, time travel, schema and partition evolution, compaction, snapshot expiry, orphan cleanup, reconciliation.
-
-## Sources and targets
-
-| Layer | Location | Format | Notes |
+| Phase | Milestone | Starts when | Produces |
 |---|---|---|---|
-| Source 1 | Postgres OLTP | rows | the Instacart tables plus synthetic users, stores, prices, payments, lifecycle |
-| Source 2 | RustFS `landing` clickstream | JSON files | built around real baskets; dirty, duplicated, late |
-| Landing | RustFS `landing` | Parquet/CSV/JSON | raw extracts plus extract metadata |
-| Bronze | Iceberg `bronze.*` | Iceberg/Parquet | append-only, faithful, with lineage |
-| Silver | Iceberg `silver.*` | Iceberg/Parquet | current state, quarantine, SCD2, conformed dimensions |
-| Gold | Iceberg `gold.*` | Iceberg/Parquet | analytics marts |
+| A | M0 Load, profile, enrich | raw files stored in landing | typed source in Postgres, defect register, rebuilt timeline |
+| B | M1 Full extraction | S tier exists in Postgres | landing extracts, manifests |
+| C | M3 Bronze | extraction works | bronze tables |
+| D | M4 Silver | bronze exists | silver, quarantine, SCD2 |
+| E | M5 Gold | silver exists | marts |
+| F | M2 Incremental extraction | change simulator exists | incremental pipeline |
+| G | M6 Evolution and WAP | gold exists | evolved schemas, branches, tags |
+| H | M7 Maintenance | tables have history | runbook |
+| I | M8 Orchestration, failure drills, reconciliation | everything exists | final report |
 
-## Milestones
+Work on the **S tier** until each phase works end to end, then re-run on M. Only touch L in Projects 2 and 4.
 
-### M0. Load, profile and constrain the source
+---
 
-- Download the Instacart files. Load each into a Postgres **staging schema as text**, then into typed tables. Bulk-load first and build indexes afterwards; compare load times.
-- Parse `products` with care (commas and quotes in names). Compare a naive loader with a proper CSV parser.
-- **Profile every table:** row counts, null rates, distinct counts, duplicate keys, value ranges. Write each defect into the **defect register**. Include: test orders with no lines, the null and capped `days_since_prior_order`, the placeholder aisle and department, basket-size distribution, products that never sell.
-- **Union the two order-line files** into one `order_items` table and keep the source file as a column. Decide how test-set orders (no lines) are modeled.
-- Add constraints in stages and see which relationships hold: primary keys (orders; the composite `order_id` + `product_id` on lines), foreign keys from lines to orders and products, products to aisles and departments. Failures are **findings**, not errors.
-- **Verify the `reordered` flag** against each user's history. How many rows disagree?
-- Build the **rebuilt timeline**: turn gaps, hours and weekdays into timestamps. Report how often the weekday doesn't fit.
-- Add the synthetic operational tables from the README (users, stores, price book, order totals and payments, lifecycle). Document each generation rule.
-- Add OLTP columns (`updated_at`, `is_deleted`), indexes (PK, FK, `updated_at`), and **leave one useful index out on purpose** (for example on the order timestamp).
-- Build the S, M and L tiers. Which defect rates stayed constant?
+## M0. Load, profile, enrich and constrain the source
 
-### M1. Full-snapshot extraction over JDBC
+**Objective:** a trustworthy operational database whose defects you know and have recorded.
 
-- Read each table in parallel. Decide the partition strategy:
-  - `orders`: numeric `order_id`; check that ids are evenly spread before assuming a range split is balanced.
-  - `order_items` (34M rows): partition on `order_id` ranges, and compare with partitioning on a hash expression and on explicit predicates. Large baskets make equal id ranges carry **unequal row counts**. Measure the imbalance.
-  - small dimensions: a single read.
-- Compare on the large table: single partition vs several `numPartitions` values; different `fetchsize` values; the table option vs a query with a subquery.
-- Land the extract as Parquet in RustFS with extract metadata (extract id, extracted_at, source table, row count). Compare Parquet, CSV and JSON for size and time.
-- **Observe in Postgres:** active connections, the exact queries Spark sent, index vs sequential scans, and the effect of the missing index.
-- Skew trap: partition on a column with uneven values (for example the hour of day or the department). Which JDBC task is slowest and why?
+**Do, in order:**
+1. **Preserve the raw files.** Keep the untouched copy in `landing/raw_dump`. Everything later must be reproducible from it.
+2. **Stage as text.** Create a staging schema where every column is text so loading never fails. Decide how to load, and measure rows per second for each way you try.
+3. **Fix parsing early.** Product names contain commas and quotes. Load once with a naive reader, count the broken rows, then with a proper quoted-CSV reader. The difference is your first defect entry.
+4. **Type the data.** Cast to proper types in a second step and capture every row that fails to cast (there should be few or none). Choose the smallest sensible types (weekday and hour fit small integers).
+5. **Profile every table.** For each: row count, null rate per column, distinct counts, min/max, length distribution of text, top values, duplicate rate on candidate keys. Add **relationship profiling** (orphan counts for every candidate foreign key, cardinality of each relationship), **distribution profiling** (basket size, orders per user, product frequency, hour and weekday), and **temporal profiling** (distribution of `days_since_prior_order`, size of the spike at the cap, share of nulls by `order_number`).
+6. **Union the line files.** Combine prior and train lines into one lines table with a source-file column. Decide how test-set orders (no lines) are represented: keep them with no lines, flag them, or move them aside. Write the decision down.
+7. **Stage constraints.** Add them in this order and record the result of each: primary keys on the small tables, on orders, then the composite key on lines; foreign keys from lines to orders and to products; products to aisles and departments. Use the "add without validating, then validate" approach where available so you can count violations instead of failing.
+8. **Verify `reordered`.** Define the rule (the user bought this product in any earlier order). Check it against the data. Interpret mismatches: is the rule wrong, or is the flag?
+9. **Build the rebuilt timeline.** Follow the design decisions in the README (start date, first order, capped gaps, weekday mismatch). Output a timestamp and a quality flag per order, plus a report of how often the weekday doesn't fit.
+10. **Generate the synthetic tables** (users, stores, price book, totals and payments, lifecycle, erasures, campaign calendar) in the order they depend on each other: users and stores first, then the price book, then totals, then payments, then lifecycle. Test each with its validity rules.
+11. **Add OLTP columns and indexes.** Add `updated_at` and `is_deleted`. Create keys and foreign-key indexes. **Deliberately skip one useful index** (for example on the order timestamp) so Projects 1 to 3 can show its effect.
+12. **Install the change-log triggers last**, after bulk loading, so loading doesn't flood the change log.
+13. **Build tiers.** S first (sample by user), then M, later L. Re-profile each tier and compare distributions with M.
 
-### M2. Incremental extraction
+**Options to explore:**
 
-- Design a high-watermark extraction on `updated_at`, driven by the **lifecycle replay**. Decide where the watermark state lives and how a failed run is retried idempotently.
-- Handle the traps: late status updates, identical timestamps (ties), item substitutions that arrive after the order is delivered, clock skew (use an overlap window and dedupe), and **hard deletes** (privacy erasures) a watermark can never see.
-- Add a periodic **full key reconciliation** to detect deletes and document its cost.
-- Compare with the change-log table (preview of Project 5): what does each approach catch and miss?
+| Decision | Options | What to compare |
+|---|---|---|
+| Loading method | server-side bulk copy / client-side copy / Spark JDBC write | rows per second, ease, error visibility |
+| Index and constraint timing | before load / after load | total load time |
+| Source table design in Postgres | single large lines table / partitioned by order date | extract speed, partition pruning, maintenance |
+| Test-set orders | keep / flag / separate table | complexity downstream |
+| Surrogate keys | natural keys only / add a surrogate to lines | JDBC partitioning ease (see M1) |
+| Statistics | analyze after load / skip | quality of Postgres plans in M1 |
 
-### M3. Bronze tables in Iceberg
+**Record / observe:** load times, database size with and without indexes, per-table profile, defect register v1, timeline quality report, constraint status table (constraint, result, violations).
 
-- Create bronze tables append-only, with lineage columns (extract id, source system, ingested_at, source file).
-- Choose properties deliberately: format version, Parquet compression, target file size. Compare two compression codecs.
-- Try three partition designs for `order_items` (34M rows): by month of the rebuilt order date, by a bucket transform on `order_id`, and by department. Predict the file counts first.
-- After each write, inspect the Iceberg metadata tables and correlate them with the objects in the RustFS console.
-- Clickstream: read JSON with an explicit schema vs an inferred one (note the extra scan), capture corrupt records, handle the schema drift you built in, write to a bronze events table.
+**Traps:**
+- Loading with constraints on hides defects behind errors.
+- Sampling S by order instead of by user breaks reorder logic.
+- Triggers installed before the bulk load make the change log huge and meaningless.
+- Timeline rebuilt without keeping the original gap and hour loses your ability to audit it.
 
-### M4. Silver: conform, dedupe, quarantine
+**Done when:** every table loaded and typed; defect register has an entry for every issue in README 3.3 (or a note that you didn't find it); constraint status table complete; timeline report written; S, M tiers exist and match the file row counts.
 
-- **Order lines:** union prior and train lines (already unioned in M0); deduplicate; validate `add_to_cart_order` as a gap-free sequence per order and flag exceptions.
-- **Orders:** validate the user history (`order_number` sequence, no gaps, no duplicates), route violations to `silver.quarantine_orders` with a reason code, and keep the raw `eval_set`.
-- **Products and taxonomy:** conform the three-level taxonomy. Replace the placeholder "missing" aisle and department with an explicit unknown value, and normalize product names.
-- **Users:** build the user dimension from the synthetic users table. Track the membership tier over time as **SCD Type 2** with MERGE (valid_from, valid_to, is_current). Verify with an as-of query.
-- **Prices:** build an effective-dated price table and price each order line using the price valid at the order timestamp. Compare doing this with a range join vs an expanded daily price table.
-- **Payments:** reconcile payments against priced lines plus fees and tip. Classify mismatches (rounding, refunds, failed tenders).
-- **Reorder flag:** rebuild `reordered` from each user's history with a window or a self-join, and compare it with the source flag. Quarantine disagreements.
-- **Current state via MERGE** from bronze changes, using `updated_at` and sequence. Apply soft deletes as flags and hard deletes from reconciliation.
-- **Copy-on-write vs merge-on-read:** switch the merge/update/delete modes. Measure write time, read time and extra delete files.
-- With ANSI mode on, use `try_*` casts. Every rejected row goes to quarantine with a reason.
+---
 
-### M5. Gold marts
+## M1. Full-snapshot extraction over JDBC
 
-Build these and record plan and runtime for each:
+**Objective:** land consistent, validated raw extracts of every table in RustFS, quickly and without hurting Postgres.
 
-1. Reorder rate by product, aisle and department.
-2. Basket analytics: items per order distribution, department mix per order, add-to-cart position vs reorder probability.
-3. Order cadence: gap between orders by user, hour-by-weekday order heatmap.
-4. User 360: order count, recency/frequency/monetary on priced orders, favorite products, department mix vector.
-5. Cohorts: retention by first-order month and by order number.
-6. Top-N products per department per month.
-7. **Product co-occurrence** (pairs bought together): the expensive one. Record the row count before and after the pair join, and revisit it in Project 2.
-8. Next-basket features: each user's last N orders (window), plus recently bought products not yet re-bought.
+**Do, in order:**
+1. **Choose a consistent snapshot approach** for the extraction, since data changes while you read: a single repeatable-read snapshot shared by all partitions, extract at a quiet moment, or accept inconsistency and fix it via reconciliation later. Decide per table.
+2. **Pick a partitioning strategy per table** (below), and determine bounds from a min/max query run just before the extract.
+3. **Measure balance first.** Before running at scale, compute the row count per partition. Large baskets mean equal order-id ranges can carry very different line counts.
+4. **Run the extract** with a modest partition count, then scale up.
+5. **Write to landing** using a path convention (source, table, extract date, extract id) in a temporary location, then publish by writing a **manifest** (table, extract id, row count, byte count, partition count, timestamps, source snapshot id) as the last step.
+6. **Validate** row counts against Postgres and a column checksum (such as a sum of ids and of a numeric column).
+7. **Repeat** with other formats and settings (grid below).
 
-Materialize with partitioning by date and a bucket on a key where useful. Compare three rewrite strategies for a reprocessed day: dynamic partition overwrite, MERGE, delete+insert. Prove each is **idempotent** by running twice and diffing.
+**Partitioning options by table:**
 
-### M6. Time travel, evolution and write-audit-publish
+| Table | Options | Notes |
+|---|---|---|
+| orders (3.4M) | numeric id ranges / hash-based predicates / per-user-bucket predicates | ids may have gaps; check evenness |
+| order_items (34M) | ranges on order id / hash of order id / month of order timestamp (needs index) / surrogate numeric key | ranges are unequal in row count |
+| small dimensions | single read | not worth splitting |
 
-- Query past snapshots by id and timestamp. Roll back a table after a deliberately bad load (for example, a wrong price-book version).
-- Evolve the schema: add, rename, drop a column; promote a type. Confirm old files are untouched.
-- **Partition evolution:** change a table from monthly to daily partitioning. Confirm existing data isn't rewritten and look at plans scanning both specs.
-- **Branches and tags:** load into a staging branch, run quality checks, publish to main. Tag month-end snapshots.
+**Options to explore:**
 
-### M7. Table maintenance
+| Knob | Values | Watch |
+|---|---|---|
+| Partition count | 1, 4, 8, 16, 32 | time, Postgres connections, slowest task |
+| `fetchsize` | small, default, large | executor memory, round trips |
+| Table option vs query with subquery | both | what Postgres executes |
+| Landing format | Parquet, CSV, JSON | size, write time, later read speed |
+| Compression | snappy, zstd, none | size, time |
+| Output file size | many small / a few large | later scan cost on RustFS |
 
-Create a deliberate small-file mess (many tiny appends), then measure scan time and object counts before and after each step:
+**Record / observe:** per-partition row counts and durations; Postgres active connections, sequential vs index scans, and queries actually received; RustFS object counts; effect of the missing index when partitioning by timestamp.
 
-| Task | Question to answer |
+**Traps:**
+- A hex or text key can't be range-partitioned numerically.
+- Predicates that don't hit an index turn every partition into a full table scan.
+- Landing without a manifest leaves you unable to tell complete extracts from partial ones.
+- Too many partitions can exceed Postgres's connection limit.
+
+**Done when:** every table extracted with matching counts and checksums; a manifest per extract; you can explain, with evidence, why you chose each partition strategy; extract of order_items is repeatable in a stable time.
+
+---
+
+## M2. Incremental extraction
+
+**Objective:** keep landing and bronze current with only the changes, correctly, including late updates and deletes.
+
+**Do, in order:**
+1. **Build or start the lifecycle replayer** so rows in Postgres change continuously (new orders, status moves, substitutions, tier changes, erasures).
+2. **Choose a strategy per table** from the options below; justify each.
+3. **Implement a control table** recording, per table and run: run id, lower and upper bound, status, row counts, started and finished times. Decide where it lives (Postgres or Iceberg).
+4. **Design the overlap window** by measuring how late updates actually arrive (maximum lag between the change and its `updated_at` becoming visible). Set the window from data, not guesswork.
+5. **Extract** the rows in the window, land them with their run id, and deduplicate on key and latest change.
+6. **Handle deletes** using the chosen approach (below).
+7. **Prove idempotency:** re-run the same window and show no change downstream. Then fail a run midway and show the next run recovers.
+8. **Reconcile** at intervals: counts and key sets between source and landing.
+
+**Strategy options by table:**
+
+| Strategy | Good for | Weakness |
+|---|---|---|
+| High watermark on `updated_at` | orders, payments, users | misses hard deletes; needs overlap for late rows; ties |
+| Monotonic key (append-only) | order lines that never change | substitutions are updates, so not safe if lines change |
+| Change-log polling | anything with triggers | extra write cost on the source |
+| Full snapshot diff | small dimensions | expensive on big tables |
+| Log-based CDC | production-grade | extra infrastructure (stretch goal) |
+
+**Delete detection options:** soft-delete flag with `updated_at`; tombstone rows in the change log; periodic full key reconciliation; both flag and reconciliation.
+
+**Traps:**
+- Clock skew and transaction commit order can make a row with an earlier timestamp appear after you've passed it.
+- Equal timestamps at the window boundary: use inclusive lower bounds plus deduplication.
+- Reviewing only counts hides updates that changed values without changing counts.
+
+**Done when:** a day of replayed changes arrives complete in landing; no missed late update in a reconciliation; hard deletes detected within your documented lag; every table's strategy has a justification and a known weakness.
+
+---
+
+## M3. Bronze tables in Iceberg
+
+**Objective:** a faithful, append-only, queryable copy of every source with full lineage.
+
+**Do, in order:**
+1. **Decide the bronze contract:** raw values as received, no business cleaning, one extra set of lineage columns (run id, extract id, source system, ingested time, source file, operation type).
+2. **Create one bronze table per source table** (snapshot loads and incremental loads in the same table, distinguished by operation and run).
+3. **Choose types:** keep source types, or keep everything as strings in bronze and cast in silver (decide and record).
+4. **Choose properties:** format version, file format, compression, target file size.
+5. **Choose partitioning** (below), predict the number of files each choice will make, then verify with the metadata tables.
+6. **Load** from landing (batch); then load the clickstream the same way. Use an explicit schema, capture corrupt records separately, and handle the planned schema drift.
+7. **Inspect** after every write: snapshots, files, manifests, partitions; compare with the objects in RustFS.
+8. **Query sanity checks:** row counts match landing manifests; sample rows traced back to source.
+
+**Partitioning options for the lines table:**
+
+| Option | Pros | Cons |
+|---|---|---|
+| Month of order date (day transform on timestamp) | prunes date filters, hidden partitioning | needs the timeline joined early |
+| Day of load time | simple, matches incremental loads | doesn't prune business-date filters |
+| Bucket on order id | enables shuffle-free joins later | no pruning |
+| Department | prunes department queries | skewed (produce) |
+| Unpartitioned with sort order | fewer small files | no partition pruning |
+
+**Options to explore:** two compression codecs; two target file sizes; typed vs all-string bronze; one table for snapshots and increments vs two.
+
+**Traps:** too many tiny partitions create many small files; changing partitioning later is possible but leaves two specs; unlabelled lineage makes later debugging impossible.
+
+**Done when:** all bronze tables loaded and reconciled with landing; each partition choice evaluated with file counts and sizes; lineage columns complete.
+
+---
+
+## M4. Silver: conform, deduplicate, quarantine, version
+
+**Objective:** trusted current-state and historical tables, with every rejected row explained.
+
+**Do, in order, per table:**
+
+| Table | Rules and decisions |
 |---|---|
-| Compaction: bin-pack vs sort vs z-order | how much faster are filtered queries? |
-| Manifest rewrite | does planning time drop? |
-| Snapshot expiry | what time-travel ability did you give up, and how much storage came back? |
-| Orphan file removal | why is it dangerous with in-flight writes, and what age cutoff is safe? |
-| Delete-file compaction | how do accumulated delete files slow reads? |
+| **Order lines** | deduplicate on order and product; validate `add_to_cart_order` as a gap-free sequence per order; flag orders with no lines; join the price valid at order time |
+| **Orders** | validate the user history (order numbers contiguous and unique); keep raw `eval_set`; apply the rebuilt timeline; flag cancelled; quarantine impossible lifecycles |
+| **Products and taxonomy** | conform the three-level taxonomy; replace the placeholder aisle and department with an explicit unknown; normalize names (trim, case, whitespace) |
+| **Users (SCD2)** | derive from synthetic users; track membership tier history with valid_from, valid_to, is_current; prove with as-of queries |
+| **Prices** | effective-dated prices; detect overlaps and gaps; resolve promotions by precedence |
+| **Payments** | reconcile against priced lines plus fees and tip; classify mismatches (rounding, refunds, failed tenders, missing rows) |
+| **Reorder flag** | rebuild from history and compare with the source flag; quarantine or flag disagreements |
+| **Clickstream** | deduplicate on event id; handle late events; map sessions to orders; quarantine malformed events |
 
-### M8. Orchestration, failures and reconciliation
+**MERGE design (do this for every current-state table):**
+1. Define the match key and the "newer wins" rule (updated_at, then sequence).
+2. Collapse the incoming batch to one row per key first.
+3. Decide how deletes arrive and how each kind (soft, hard) is applied.
+4. Prove idempotency (apply the same batch twice, nothing changes).
 
-- Define run order and dependencies, then re-run one day end to end.
-- **Inject failures:** kill a worker mid-write; stop RustFS mid-commit; stop Postgres mid-extract. For each, verify that readers never see a partial table and record leftover files.
-- Produce a **reconciliation report** across the raw files, Postgres, landing, bronze, silver and gold, explaining every legitimate difference (filtered, quarantined, deleted, deduplicated). Tie each difference to a defect-register entry.
+**Quarantine design:** one quarantine table per entity, with the original row, a reason code from a **catalog of codes** (for example: cast failure, lifecycle violation, missing parent, duplicate key, out-of-range), rule version, and run id. Decide for each rule whether it **rejects**, **flags**, or only **counts**.
 
-## Config and property experiments
+**Data-quality rule catalog (build and run these):** completeness (required fields), validity (ranges and formats), uniqueness (keys), referential integrity (parent exists), consistency (cross-table totals), timeliness (late arrivals). Store metrics per run so you can chart them.
+
+**Options to explore:**
+
+| Experiment | Options | Measure |
+|---|---|---|
+| Write mode for merges | copy-on-write vs merge-on-read | write time, read time, delete files |
+| Update size | 0.1%, 1%, 10% of rows | break-even point between modes |
+| SCD2 construction | MERGE in steps vs build the changed rows then insert | complexity and speed |
+| Price join | range join vs daily-expanded price table | time and plan |
+| Dedup | arbitrary row vs deterministic latest | plan and result stability |
+| Casting | strict (fail) vs `try_*` (quarantine) | rows rejected, behavior |
+
+**Traps:** double-counting test orders; silently dropping rows instead of quarantining; non-deterministic dedup (different runs choose different rows); merging without collapsing the batch first.
+
+**Done when:** each silver table has a documented rule list, a quarantine reason catalog, and row accounting that balances (bronze rows = silver rows + quarantined + deduplicated); SCD2 as-of queries return correct history; merge idempotency is proven.
+
+---
+
+## M5. Gold marts
+
+**Objective:** analytics-ready tables with verified numbers and a refresh strategy.
+
+**Do, in order, for each mart:** write its grain and purpose; list inputs; define the logic and pitfalls; choose a refresh strategy; test with invariants; record plan and runtime.
+
+| Mart | Grain | Logic and pitfalls | Invariant to test |
+|---|---|---|---|
+| Reorder rate | product, aisle, department | exclude orders with no lines; define denominators carefully | rates between 0 and 1; totals match lines |
+| Basket analytics | order | items per order, department mix, position vs reorder | sum of items equals line count |
+| Order cadence | user, hour by weekday | gap distribution; treat capped gaps as censored | counts match orders |
+| User 360 | user | recency, frequency, monetary on priced orders; favorites; department vector | user counts match |
+| Cohorts | first-order month by order number | careful with incomplete months | cohort sizes sum to users |
+| Top-N | department by month | ties and deterministic ordering | N rows per group |
+| Co-occurrence | product pair | the expensive one (see Project 2); decide pruning and basket caps | symmetry and counts reproduce on a sample |
+| Next-basket features | user, as-of date | window over last N orders; leakage control (nothing after the as-of date) | no future data used |
+
+**Refresh strategy options:** full rebuild; partition overwrite by date; MERGE of changed groups; delete and insert. **Test each for idempotency by running twice and diffing.**
+
+**Options to explore:** partition by date vs by department; bucket by user; pre-aggregate before joining; cache an input used by several marts; sort order for the dominant filter.
+
+**Done when:** every mart has a documented grain and passing invariants; each of the three refresh strategies tried on one mart with evidence; reruns produce identical outputs.
+
+---
+
+## M6. Time travel, evolution and write-audit-publish
+
+**Objective:** use Iceberg's versioning safely.
+
+**Do, in order:**
+1. **Time travel:** read past snapshots by id and by timestamp; compare a gold number before and after a load.
+2. **Bad-load recovery:** deliberately load wrong data (for example a mis-versioned price book), detect it with a check, and roll back. Record what was rolled back and what remained.
+3. **Schema evolution matrix:** add a nullable column, add a column with a default meaning, rename, drop, widen a type, reorder. For each, check old and new readers and previously written files.
+4. **Partition evolution:** change the lines table from monthly to daily. Confirm old files stay in the old layout; read plans that touch both specs; decide whether to rewrite old data.
+5. **Branches and tags:** stage a load on a branch; run the data-quality suite against the branch; publish by moving main only if checks pass; tag month-end snapshots for audit.
+6. **Retention policy:** define how long you keep snapshots and tags and why.
+
+**Traps:** forgetting that expiring snapshots removes time travel; renames that downstream readers depend on; publishing a branch without re-running checks after later changes.
+
+**Done when:** a rollback restored a clean state; every evolution type has a recorded outcome; a failing check blocked a publish.
+
+---
+
+## M7. Table maintenance
+
+**Objective:** a runbook that keeps tables fast and storage bounded.
+
+**Do, in order:**
+1. **Baseline** the tables: file counts and sizes, manifest counts, snapshot counts, delete files, scan time of three reference queries.
+2. **Create the mess:** many tiny appends, many merges producing delete files, many snapshots.
+3. **Re-measure** the same baselines to see the damage.
+4. **Apply each action separately** and measure what it fixes:
+
+| Action | Parameters to explore | Question to answer |
+|---|---|---|
+| Compaction | bin-pack vs sort vs z-order; target size; minimum input files | how much faster are filtered queries? |
+| Manifest rewrite | when planning time is high | does planning time drop? |
+| Delete-file compaction | after many merges in merge-on-read | does read time recover? |
+| Snapshot expiry | retention age, minimum snapshots kept | what time travel did you lose; how much storage returned? |
+| Orphan removal | age threshold | why dangerous with in-flight writes; what is a safe cutoff? |
+
+5. **Order the actions** in a schedule and test the schedule while a writer is running.
+6. **Write the runbook:** cadence per table type, triggers (file count or small-file ratio), safety rules, and alerts.
+
+**Traps:** orphan removal with too short an age can delete files of an in-progress commit; compaction competing with writers causes conflicts; expiry shrinking history below your rollback needs.
+
+**Done when:** each action has a measured benefit; the schedule survives a concurrent writer; the runbook exists.
+
+---
+
+## M8. Orchestration, failure drills and reconciliation
+
+**Objective:** prove the pipeline is repeatable, recoverable and accountable.
+
+**Do, in order:**
+1. **Draw the dependency graph** (extract, bronze, silver, gold, maintenance) and choose run ordering and retry rules.
+2. **Rerun tests:** rerun one day end to end; rerun a failed middle step; backfill a past day. Show identical results each time.
+3. **Failure drill matrix:**
+
+| Inject | Expect | Verify |
+|---|---|---|
+| Kill a worker mid-write | task retry, success | no duplicate or partial data |
+| Stop RustFS mid-commit | failed or retried commit | table unchanged; list leftover files |
+| Stop Postgres mid-extract | failed extract | no half-published extract; manifest absent |
+| Kill the driver mid-merge | failed run | rerun applies exactly once |
+| Corrupt a landing file | quarantine path | pipeline continues, defect recorded |
+
+4. **Reconciliation report** across the raw files, Postgres, landing, bronze, silver and gold: row counts, key-set differences, and totals (lines, items, priced amounts). Explain **every** difference, linking each to a defect-register entry (filtered, quarantined, deleted, deduplicated).
+5. **Lessons:** list what you would automate, monitor and alert on.
+
+**Done when:** every drill's outcome matches your prediction (or the surprise is explained); the reconciliation has zero unexplained differences.
+
+---
+
+## Config and property experiments (summary)
 
 | Area | Knobs |
 |---|---|
-| JDBC | `numPartitions`, `fetchsize`, partition strategy, pushdown options |
-| Spark | shuffle partitions, AQE, `spark.sql.sources.partitionOverwriteMode` |
+| JDBC | partitions, fetch size, partition strategy, pushdown options |
+| Spark | shuffle partitions, AQE, partition overwrite mode |
 | Iceberg write | target file size, distribution mode, compression, merge/update/delete mode |
 | Iceberg layout | partition transforms, sort order, format version |
-| Storage | S3A or Iceberg S3 file I/O settings against RustFS (Project 4) |
+| Storage | S3A or Iceberg file I/O settings against RustFS (Project 4) |
 
 ## Stretch goals
+- Move the catalog to a standalone REST catalog and note what changes.
+- Package the pipeline as a parameterized application with `spark-submit` (client mode, then cluster mode on standalone).
+- Add a reverse-ETL step writing a gold aggregate to a Postgres reporting table with controlled parallelism.
 
-- Move the catalog from JDBC to a REST catalog and note what changes.
-- Package the pipeline as a parameterized application and run it with `spark-submit` in client mode; try cluster mode and see what standalone allows for Python apps.
-- Add a reverse-ETL step writing a gold aggregate back to a Postgres reporting table with controlled parallelism.
-
-## Done when you can answer
-
-1. Which Instacart defects did you find, and which rule handled each?
-2. Why do test-set orders have no lines, and how did you model them?
-3. Why can equal id ranges give very unequal JDBC partitions here?
-4. When is merge-on-read better than copy-on-write, and what does it cost readers?
-5. Why can readers never see half a write, even when you killed a worker mid-commit?
+## Exit criteria for Project 1
+1. You can state each Instacart defect, how you found it, and which rule handles it.
+2. Every layer reconciles to the one before it.
+3. Rerunning any step is safe.
+4. Your maintenance runbook has measured effects.
