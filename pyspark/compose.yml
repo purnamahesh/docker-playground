@@ -1,5 +1,22 @@
 
 services:
+  rustfs:
+    image: rustfs/rustfs:1.0.4
+    ports:
+      - 9000:9000
+      - 9001:9001
+    volumes:
+      - ./work_dir/rustfs-data:/data
+      - ./work_dir/rustfs-logs:/logs
+    environment:
+      - RUSTFS_ACCESS_KEY=admin
+      - RUSTFS_SECRET_KEY=admin
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_OBS_LOGGER_LEVEL=error
+      - RUSTFS_OBS_LOG_DIRECTORY=/logs/
+    networks:
+      - spark-network
+
   instacart:
     image: postgres:16
     container_name: instacart
@@ -12,7 +29,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - ./work_dir/data/pgdata:/var/lib/postgresql/data
+      - ./pgdata:/var/lib/postgresql/data
       - ./work_dir/sql/init.sql:/docker-entrypoint-initdb.d/init.sql
       - ./work_dir/data/InstaCart:/tmp/InstaCart
     networks:

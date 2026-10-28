@@ -3,5 +3,9 @@
 *.csv
 .Trash*
 .ipynb_checkpoints
+.rustfs.sys
 spark-events
 pgdata/
+rustfs-data
+rustfs-logs
+.rustfs-replacement.lock
