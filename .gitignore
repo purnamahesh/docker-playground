@@ -9,3 +9,4 @@ pgdata/
 rustfs-data
 rustfs-logs
 .rustfs-replacement.lock
+aws-java-sdk-bundle-2.55.16.jar
