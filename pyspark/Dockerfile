@@ -37,3 +37,4 @@ WORKDIR /home/ubuntu/work_dir
 FROM base AS jupyter
 
 RUN /opt/venv/bin/pip install --no-cache-dir jupyterlab
+RUN /opt/venv/bin/pip install --no-cache-dir boto3 fg-data-profiling ipywidgets
