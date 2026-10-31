@@ -49,7 +49,7 @@ services:
       - /opt/spark/bin/spark-class
       - org.apache.spark.deploy.master.Master
     volumes:
-      - ./work_dir:/home/icarus/work_dir
+      - ./work_dir:/home/ubuntu/work_dir
       - ./spark-events:/tmp/spark-events
     networks:
       - spark-network
@@ -66,12 +66,12 @@ services:
       - org.apache.spark.deploy.worker.Worker
       - spark://spark-master:7077
     volumes:
-      - ./work_dir:/home/icarus/work_dir
+      - ./work_dir:/home/ubuntu/work_dir
       - ./spark-events:/tmp/spark-events
     environment:
-      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_CORES=3
       - SPARK_WORKER_DIR=/tmp/spark-work
-      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_MEMORY=3g
     networks:
       - spark-network
     depends_on:
@@ -105,13 +105,13 @@ services:
     hostname: jupyter
     command: >
       jupyter lab --ip=0.0.0.0 --port=8888 --no-browser
-      --notebook-dir=/home/icarus/work_dir
+      --notebook-dir=/home/ubuntu/work_dir
       --IdentityProvider.token=''
     ports:
       - 8888:8888
       - 4040:4040
     volumes:
-      - ./work_dir:/home/icarus/work_dir
+      - ./work_dir:/home/ubuntu/work_dir
       - ./spark-events:/tmp/spark-events
     networks:
       - spark-network

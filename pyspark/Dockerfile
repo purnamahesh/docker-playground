@@ -18,12 +18,13 @@ RUN tar -xzf spark-${SPARK_VERSION}-bin-hadoop3.tgz -C /opt \
     && mv /opt/spark-${SPARK_VERSION}-bin-hadoop3 /opt/spark 
 
 ENV SPARK_HOME=/opt/spark
-ENV PYSPARK_PYTHON="python3"
+ENV PYSPARK_PYTHON="/opt/venv/bin/python"
 RUN ln -s ${SPARK_HOME}/python/lib/py4j-*-src.zip ${SPARK_HOME}/python/lib/py4j-src.zip
 ENV PYTHONPATH="${SPARK_HOME}/python:${SPARK_HOME}/python/lib/pyspark.zip:${SPARK_HOME}/python/lib/py4j-src.zip"
 ENV PATH="/opt/venv/bin:${SPARK_HOME}/bin:${SPARK_HOME}/sbin:${PATH}"
 
 RUN python3 -m venv /opt/venv
+RUN /opt/venv/bin/pip install --no-cache-dir pyarrow
 
 RUN usermod -aG sudo ubuntu
 RUN echo '%sudo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers \
