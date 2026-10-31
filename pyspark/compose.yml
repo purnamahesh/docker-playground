@@ -37,7 +37,9 @@ services:
       - spark-network
     
   spark-master:
-    build: .
+    build:
+      context: .
+      target: base
     container_name: spark-master
     hostname: spark-master
     ports:
@@ -55,7 +57,9 @@ services:
     #   - db
   
   spark-worker:
-    build: .
+    build:
+      context: .
+      target: base
     hostname: spark-worker
     command:
       - /opt/spark/bin/spark-class
@@ -74,7 +78,9 @@ services:
       - spark-master
 
   spark-history-server:
-    build: .
+    build:
+      context: .
+      target: base
     container_name: spark-history-server
     hostname: spark-history-server
     command:
@@ -92,7 +98,9 @@ services:
       - spark-master
 
   jupyter:
-    build: .
+    build:
+      context: .
+      target: jupyter
     container_name: jupyter
     hostname: jupyter
     command: >

@@ -1,4 +1,4 @@
-FROM ubuntu:24.04
+FROM ubuntu:24.04 AS base
 
 ARG SPARK_VERSION=4.2.0
 
@@ -23,8 +23,7 @@ RUN ln -s ${SPARK_HOME}/python/lib/py4j-*-src.zip ${SPARK_HOME}/python/lib/py4j-
 ENV PYTHONPATH="${SPARK_HOME}/python:${SPARK_HOME}/python/lib/pyspark.zip:${SPARK_HOME}/python/lib/py4j-src.zip"
 ENV PATH="/opt/venv/bin:${SPARK_HOME}/bin:${SPARK_HOME}/sbin:${PATH}"
 
-RUN python3 -m venv /opt/venv \
-    && /opt/venv/bin/pip install --no-cache-dir jupyterlab
+RUN python3 -m venv /opt/venv
 
 RUN usermod -aG sudo ubuntu
 RUN echo '%sudo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers \
@@ -34,3 +33,7 @@ RUN echo '%sudo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers \
 USER ubuntu
 
 WORKDIR /home/ubuntu/work_dir
+
+FROM base AS jupyter
+
+RUN /opt/venv/bin/pip install --no-cache-dir jupyterlab
