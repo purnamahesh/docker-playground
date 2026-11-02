@@ -1,39 +1,73 @@
-# Project 5: Streaming and CDC into Iceberg (Instacart)
+# Project 5: Streaming and CDC into Delta Lake (Instacart)
+
+> **Before you start:** read `00-start-here.md` once. Use `07-learning-companion.md` (P5 section) for prerequisites, the minimal path, time-boxes, prediction prompts, concept checks, rubric and teach-back. Use `08-debugging-playbook.md` when stuck and `09-reference-answers.md` for calibration.
 
 ## Goal
 
-Build a near-real-time pipeline in which clickstream files in RustFS and row changes from Postgres flow through Structured Streaming into Iceberg bronze, silver and gold, with windows, sessions, CDC apply, deduplication, failure recovery, ongoing maintenance and measured freshness.
+Build a near-real-time pipeline: clickstream files landing in RustFS and row changes captured from Postgres flow through Structured Streaming into Delta bronze, silver and gold, with windows, sessions, change-data-capture (CDC) apply, failure recovery and measured freshness.
 
-## Work plan (what happens when)
+**This is the only project that uses CDC and database triggers.** Earlier projects used watermarks and key comparisons instead.
 
-| Phase | Milestone | Starts when | Produces |
+**Simplified scope:** seven core milestones (M0 to M6) plus an optional Depth block and a short operating-guide step.
+
+## Work plan
+
+| Phase | Milestone | Core? | Produces |
 |---|---|---|---|
-| A | M0 Sources, speeds and SLOs | Project 1 silver exists | producers, replay settings, targets |
-| B | M1 Clickstream ingest to bronze | M0 done | working stream, checkpoint understanding |
-| C | M2 Small files and maintenance | M1 running | maintenance schedule compatible with streaming |
-| D | M3 to M4 Windows and sessions | M1 done | gold streaming tables |
-| E | M5 CDC apply into silver | change log live | idempotent CDC pipeline |
-| F | M6 Dedup and joins | M3 done | join and dedup patterns |
-| G | M7 State and throughput tuning | stateful queries exist | tuning guide |
-| H | M8 Failure and evolution drills | all queries running | recovery runbook |
-| I | M9 Latency and SLOs | all above | freshness report |
-| J | M10 Synthesis | all above | operating guide |
+| A | M0 Sources, speeds and service levels | Core | producers, change log, targets |
+| B | M1 Clickstream into bronze | Core | working stream, checkpoint understanding |
+| C | M2 Windows and watermarks | Core | windowed metrics |
+| D | M3 Sessions | Core | session table |
+| E | M4 CDC apply into silver | Core | idempotent change-apply job |
+| F | M5 Delta change data feed | Core | change-feed propagation to gold |
+| G | M6 Failure drills and recovery | Core | recovery runbook |
+| H | M7 Latency and service levels | Core | freshness report |
+| I | Depth: maintenance, dedup and joins, state tuning | Optional | extra notes |
+| J | M8 Operating guide | Core | one document |
+
+## Terms used in this project
+
+| Term | Meaning |
+|---|---|
+| **Micro-batch** | Structured Streaming processes new data in small batches |
+| **Trigger** | how often a micro-batch starts (fixed interval, or "available now" = process what exists then stop) |
+| **Checkpoint** | files that record how far the stream has read and committed, so it can resume exactly |
+| **Event time vs processing time** | when the event happened vs when Spark saw it |
+| **Watermark (streaming)** | how long Spark waits for late events before closing windows and dropping later data |
+| **State** | data Spark keeps between batches (open windows, sessions, dedup keys) |
+| **Exactly-once** | each input is reflected in the output once, even across restarts |
+| **Idempotent sink** | writing the same batch twice has the same effect as once |
+| **CDC** | capturing row changes (insert, update, delete) as events |
+| **Change log** | a table in Postgres where triggers record each change |
+| **Sequence number** | a strictly increasing number on each change so order is unambiguous |
+| **Change data feed (CDF)** | Delta's built-in record of row-level changes between table versions |
 
 ---
 
-## M0. Sources, replay speeds and service levels
+## M0. Sources, speeds and service levels
 
-**Objective:** controllable inputs and targets to measure against.
+**Objective:** controllable inputs and clear targets to measure against.
 
 **Do, in order:**
-1. **Clickstream producer:** generate JSON sessions around real baskets (cart adds in the real add-to-cart order, searches, views, non-converting sessions). Control event rate, file size, and files per minute. Include the planned defects: duplicates and replays, malformed lines, schema drift partway through, out-of-order events, about 2% very late events.
-2. **Write files safely:** write to a temporary name and rename so readers never see a partial file; decide the object naming convention (time-ordered or random).
-3. **CDC source:** run the **lifecycle replayer** against Postgres with an adjustable time-compression factor (for example one real hour in one second). Check that the change log fills with ordered, complete entries.
-4. **Choose three speeds:** low (below capacity), medium (near capacity) and high (above capacity), so you can study backlog.
-5. **Define service levels before building:** freshness (a change visible in gold within N minutes), completeness (no loss), duplicates (none in silver), maximum late-data tolerance.
-6. **Prepare reference truth:** a batch computation of the same period for each stream (windows, sessions, current state) to compare against.
+1. **Clickstream producer.** Generate JSON sessions around real baskets (cart adds in the real add-to-cart order, searches, views, non-converting sessions). Control event rate and file size. Include planned defects: duplicates and replays, malformed lines, schema drift partway, out-of-order events, about 2% very late events. Write each file to a temporary name and rename it, so readers never see a partial file.
+2. **Create the change log in Postgres (CDC starts here).** A change log is a table that records every change to a source table. Install **triggers** on the orders (and a few other) tables that insert one row per change into the log. Each log row holds: a sequence number (strictly increasing), table name, operation (I, U or D), the primary key, the row's values before and after, and the time of change. Install triggers **after** any bulk loading so you don't flood the log.
+3. **Run the change simulator** against Postgres at an adjustable speed (for example one simulated hour per real second). Check the log is ordered and complete: every update to an order produces exactly one log row.
+4. **Choose three speeds:** low (below capacity), medium (near it), high (above it).
+5. **Define service levels before building:** *freshness* (a change visible in gold within N minutes), *completeness* (no loss), *duplicates* (none in silver), *late-data tolerance* (how late an event may be and still count).
+6. **Prepare batch reference truth:** a batch computation of the same period for windows, sessions and current state, to compare against.
 
-**Done when:** producers run at three speeds, the change log is verified, and the service levels are written down.
+**Example change-log rows (illustrative):**
+
+| seq | table | op | key | after (summary) | changed_at |
+|---|---|---|---|---|---|
+| 1001 | orders | I | 7788 | status=placed | 10:00:01 |
+| 1002 | orders | U | 7788 | status=accepted | 10:02:30 |
+| 1003 | orders | U | 7788 | status=delivered | 10:41:12 |
+| 1004 | orders | D | 5521 | (erasure) | 10:42:00 |
+
+**Done when:** producers run at three speeds, the change log is verified, and service levels are written down.
+
+**Read more:** PostgreSQL CREATE TRIGGER https://www.postgresql.org/docs/current/sql-createtrigger.html | Spark Structured Streaming guide https://spark.apache.org/docs/latest/structured-streaming-programming-guide.html
 
 ---
 
@@ -42,215 +76,193 @@ Build a near-real-time pipeline in which clickstream files in RustFS and row cha
 **Objective:** ingest files exactly once and understand the checkpoint.
 
 **Do, in order:**
-1. Read the landing bucket as a file stream with an **explicit schema** (decide how to treat corrupt lines and the drifted field) and cap files per trigger.
-2. Write to an Iceberg bronze table with the checkpoint stored in RustFS.
-3. **Inspect the checkpoint** folder: offsets, commits, sources and metadata. Write down what each represents.
-4. **Compare triggers:** fixed interval, available-now (process everything, then stop) and once.
-5. **Prove exactly-once:** stop and restart the query a few times (also mid-batch), then compare the bronze count with a batch read of the same input objects.
-6. Watch the progress metrics: input rate, processing rate, batch id, duration breakdown.
-7. **Measure listing cost** on the object store as the landing prefix grows; test the file source's cleanup options (archive or delete processed files) and see the effect on listing time.
-8. Decide the **partitioning** of the bronze table (day of ingestion, hour, none) and predict the file counts.
+1. Read the landing bucket as a **file stream** with an explicit schema (decide how to treat corrupt lines and the drifted field) and cap the number of files per batch.
+2. Write to a Delta bronze table with the **checkpoint stored in RustFS**. A Delta sink supports append (and complete) output modes.
+3. **Inspect the checkpoint folder:** offsets (what was planned), commits (what finished), sources, metadata. Write down what each represents.
+4. **Compare triggers:** fixed interval vs available-now (process everything then stop).
+5. **Prove exactly-once:** stop and restart the query several times (also in the middle of a batch), then compare the bronze count with a batch read of the same objects.
+6. Watch progress metrics: input rate, processing rate, batch id, duration breakdown.
+7. **Listing cost:** a file stream lists the input folder on every batch. Listing returns about 1,000 keys per request, one page after another, so 10k, 100k and 1M objects need roughly 10, 100 and 1,000 requests. Measure how batch time grows as the prefix grows; try the source's cleanup options (archive or delete processed files).
 
 **Options to explore:**
 
 | Variable | Values | Watch |
 |---|---|---|
-| Trigger | 2 s, 10 s, 60 s, available-now | latency, files per commit, efficiency |
-| Files per trigger | 1, 2, 10, unlimited | batch size, backlog |
-| Cleanup of processed files | off, archive, delete | listing time, risk |
-| Schema handling | strict, permissive, evolve | behavior on drift |
+| Trigger | 2 s, 10 s, 60 s, available-now | latency, files per commit |
+| Files per batch | 1, 2, 10, unlimited | batch size, backlog |
+| Cleanup of processed files | off, archive, delete | listing time |
 
-**Traps:** unbounded file listing slows every batch; late-arriving files with older names can be missed if the naming scheme isn't monotonic (decide how the source orders files); cleanup deleting files you may want to replay.
+**Traps:** unbounded listing slows every batch; deleting files you may want to replay.
 
 **Done when:** restarts never lose or duplicate; batch metrics are understood; counts match batch reads.
 
----
-
-## M2. Small files, snapshots and maintenance
-
-**Objective:** keep streaming tables healthy without disturbing the stream.
-
-**Do, in order:**
-1. After an hour at medium speed, count data files and snapshots in bronze and relate them to batch frequency and parallelism.
-2. Run **compaction and snapshot expiry while the stream runs.** Record commit conflicts or retries.
-3. Test sink options: fanout writing for partitioned sinks versus a sorted write; table target file size; distribution mode.
-4. Find the **trigger interval** that meets both freshness and file-count targets.
-5. Design the **maintenance schedule:** cadence, order (compact, rewrite manifests, expire, remove orphans), safe windows, safety margins relative to the checkpoint.
-
-**Options to explore:**
-
-| Approach | Pro | Con |
-|---|---|---|
-| Frequent small commits | low latency | many files and snapshots |
-| Longer trigger | fewer files | higher latency |
-| Compact often in the background | fast reads | conflicts with the writer |
-| Write bigger files from the start | fewer maintenance jobs | needs buffering |
-
-**Traps:** orphan removal deleting files of an in-flight commit; expiring snapshots the stream still needs.
-
-**Done when:** a schedule runs while the stream is live, with a recorded conflict count, and bronze stays within file-count targets.
+**Read more:** Delta streaming https://docs.delta.io/latest/delta-streaming.html | Structured Streaming guide https://spark.apache.org/docs/latest/structured-streaming-programming-guide.html
 
 ---
 
-## M3. Windowed aggregates and watermarks
+## M2. Windows and watermarks
 
 **Objective:** correct windowed metrics with explicit late-data behavior.
 
+**Concepts:** a **window** groups events by event time (for example each minute). The **watermark** is "the latest event time seen minus the allowed lateness". A window is finalized when the watermark passes its end; events older than the watermark are dropped.
+
+**Worked example (illustrative), watermark = 10 minutes:**
+
+| Event time | Latest event time seen | Watermark | Result |
+|---|---|---|---|
+| 10:05 | 10:30 | 10:20 | **dropped** (older than watermark) |
+| 10:22 | 10:30 | 10:20 | kept (within lateness) |
+| 10:30 | 10:30 | 10:20 | kept |
+
 **Do, in order:**
-1. Compute **one-minute tumbling** and **five-minute sliding** counts by event type with a ten-minute watermark.
-2. Find which **output modes** Iceberg's streaming sink supports and which are disallowed for this query; where you need upserts, route through a batch-by-batch merge instead.
-3. **Sweep the watermark** (1 minute, 10 minutes, 1 hour) and record emission delay, dropped late rows and state size.
-4. Reconcile dropped rows with the producer's known late events.
-5. Compare tumbling and sliding windows on state size.
-6. Compare the stream result with the batch truth.
+1. Compute **one-minute tumbling** counts by event type with a ten-minute watermark; write to a Delta table (append mode emits a window only once the watermark has passed it).
+2. Find which output modes your sink supports and which are disallowed for this query. When you need upserts, route through a per-batch MERGE (see M4).
+3. **Sweep the watermark** (1 minute, 10 minutes, 1 hour); record how long a window takes to appear, how many late rows are dropped, and state size.
+4. Reconcile the dropped rows with the producer's known late events.
+5. Compare the stream result with the batch truth.
 
-**Options to explore:**
+**Done when:** the stream matches batch except for rows beyond the watermark, and you can explain the difference exactly.
 
-| Variable | Values | Watch |
-|---|---|---|
-| Watermark | 1 min, 10 min, 1 h | delay, drops, state |
-| Window | tumbling vs sliding | state, output volume |
-| Output mode | append, update, complete (where allowed) | behavior and sink support |
-
-**Done when:** the stream result matches batch truth except for late rows beyond the watermark, and you can explain the difference exactly.
+**Read more:** Structured Streaming guide (windows and watermarks) https://spark.apache.org/docs/latest/structured-streaming-programming-guide.html
 
 ---
 
-## M4. Sessionization
+## M3. Sessions
 
 **Objective:** sessions per user with controlled state.
 
+**Concepts:** a **session** is a run of events by one user where no gap exceeds a limit (for example 30 minutes). Spark has a built-in session window for this.
+
+**Example (illustrative), gap = 30 minutes:**
+
+| User | Event times | Sessions |
+|---|---|---|
+| 42 | 10:00, 10:10, 10:25, 11:30, 11:40 | session 1: 10:00 to 10:25; session 2: 11:30 to 11:40 |
+
 **Do, in order:**
-1. Compute **30-minute-gap sessions** per user into a gold Iceberg table: events, cart adds, conversions, revenue, start and end.
-2. Verify against a batch computation over the same period.
-3. Watch state size and memory per batch for different watermark lengths.
-4. Find the **hot user's** state partition in the metrics (the bulk buyer).
-5. Test session gap values (10, 30, 60 minutes) and see how session counts change.
-6. Stretch: implement the same logic with the arbitrary-state API (check availability in PySpark for your Spark version) and compare flexibility, cost and correctness.
+1. Compute 30-minute-gap sessions per user into a gold Delta table: events, cart adds, conversions, revenue, start, end.
+2. **Verify against a batch computation** over the same closed period.
+3. Watch state size and memory per batch. The injected bulk buyer concentrates state in one partition; find it in the metrics.
+4. Try gaps of 10, 30 and 60 minutes; see how session counts change.
 
-**Traps:** sessions that straddle watermark boundaries get emitted late or split; hot keys concentrate state.
+**Done when:** streamed sessions equal batch sessions on closed periods; you understand how state grows.
 
-**Done when:** streamed sessions equal batch sessions on closed periods; the state growth model is understood.
+**Read more:** Structured Streaming guide (session windows) https://spark.apache.org/docs/latest/structured-streaming-programming-guide.html
 
 ---
 
-## M5. CDC apply into silver
+## M4. CDC apply into silver
 
-**Objective:** keep silver current-state tables correct under out-of-order, repeated and deleted changes.
+**Objective:** keep silver current-state tables correct under repeated, out-of-order and deleted changes.
+
+**Why it matters:** the change log tells you *what changed*; applying it correctly means updates must land in order, a replayed batch must not double-apply, and deletes must be honored.
+
+**Out-of-order example (illustrative):** order 7788 changes: seq 1002 (accepted), seq 1003 (delivered). If a batch arrives with 1003 first, then 1002, a naive apply ends with "accepted". The rule: ignore any change whose sequence is **lower than the sequence already applied** for that key.
 
 **Do, in order:**
-1. **Poll the change log in micro-batches,** using the last applied sequence as the position.
-2. In each batch: collapse to the **latest change per key** by sequence; separate inserts, updates, soft deletes and hard deletes.
-3. **MERGE into silver** with the match key, a rule that ignores older changes than what the target already holds (sequence comparison), and delete handling.
-4. **Make each batch idempotent:** if a batch is replayed after a failure the result must be unchanged. Decide where you record the last applied batch or sequence (a control table, or a table property updated in the same commit).
-5. **Test disorder:** shuffle the order of changes in a batch, replay old batches, drop one batch and detect the gap.
-6. **Test deletes:** erasure requests (hard deletes plus anonymization) and cascade effects.
-7. Compare two designs: **apply with MERGE** versus **append-only changelog plus a latest-per-key view**. Compare write cost, read cost, auditability and storage.
-8. Try **incremental reads from an Iceberg table** (as a streaming source and through a changelog view); document which snapshot types (append, overwrite, delete) are supported and how skip options behave.
+1. **Poll the change log in micro-batches,** using the last applied sequence as your position.
+2. In each batch: **collapse to the latest change per key** (highest sequence); separate inserts, updates and deletes.
+3. **MERGE into silver** with the match key, a sequence comparison (don't overwrite newer with older), and delete handling.
+4. **Make each batch idempotent.** If a batch is replayed after a failure, the result must be unchanged. Two Delta-native tools: record the last applied sequence **in the same transaction** as the merge; and use Delta's idempotent-write options for per-batch writes (an application id plus the batch id as a transaction version, so Delta ignores a repeated batch).
+5. **Test disorder:** shuffle changes within a batch; replay an old batch; drop one batch and detect the gap.
+6. **Test deletes:** erasure requests (hard delete plus anonymize) and their cascade.
+7. Compare two designs: **apply with MERGE** vs **append-only changes plus a latest-per-key view** (cost, audit, storage).
 
 **Options to explore:**
 
 | Variable | Values | Watch |
 |---|---|---|
-| Apply design | merge vs append-only log | cost, correctness, audit |
-| Batch size | small, large | commit rate, conflict risk |
-| Merge mode | copy-on-write vs merge-on-read | write time, read time |
-| Ordering key | sequence vs timestamp | tie handling |
-| Position storage | control table vs table property | atomicity |
+| Apply design | MERGE vs append-only log + view | write cost, read cost, audit |
+| Batch size | small / large | commit rate |
+| Update mechanism | rewrite files vs deletion vectors | write and read time |
 
-**Traps:** applying changes out of order without a sequence check; a merge that isn't atomic with its position update; changes that arrive for rows not yet seen.
+**Traps:** applying changes without a sequence check; a MERGE that isn't atomic with its position update; changes for rows not yet seen; running the CDC job and a maintenance job as two separate applications on the same table (single-writer rule).
 
 **Done when:** replaying, reordering and dropping batches never corrupts silver, and the final state equals the batch rebuild.
 
+**Read more:** Delta MERGE https://docs.delta.io/latest/delta-update.html | Delta streaming (foreachBatch, idempotent writes) https://docs.delta.io/latest/delta-streaming.html | Idempotence https://en.wikipedia.org/wiki/Idempotence
+
 ---
 
-## M6. Deduplication and joins
+## M5. Delta change data feed (the Delta-native alternative)
 
-**Objective:** correct streaming dedup and joins with bounded state.
+**Objective:** propagate changes from silver to gold using Delta's own change record.
+
+**Concepts:** if a Delta table has the change data feed enabled, Delta records, for each commit, which rows were inserted, updated (before and after images) and deleted. You read it with a version or timestamp range. Each change row carries a change type (insert, update before, update after, delete), the commit version and commit time.
 
 **Do, in order:**
-1. **Dedup** clickstream by event id: classic dedup with a watermark versus dedup within the watermark. Test with the producer's replays and compare state size.
-2. **Stream-static join** against a silver Iceberg dimension (such as users or products) that the CDC job keeps updating. Does the stream see dimension updates committed while it runs? Prove it experimentally.
-3. **Stream-stream join:** views to cart adds to purchases within a window. Requirements: watermarks on both sides and a time-range condition. Try inner and outer joins and note when unmatched rows are emitted.
-4. **Break it:** remove a watermark and observe the error or unbounded state.
-5. Compare the result with the batch truth.
+1. Enable the change data feed on a silver table (it records changes only from that point on).
+2. Update and delete some rows; **read the change feed** for those versions and match each change to what you did.
+3. Build a small streaming or batch job that reads the feed and maintains a gold aggregate incrementally.
+4. Compare with M4: what does the feed give you that the change log doesn't (it works at the table level, needs no triggers), and what does it not (it only exists for Delta tables; retention is tied to table history).
+5. Check how the feed interacts with deletion vectors and VACUUM in your version (feed data can disappear after VACUUM).
 
-**Options to explore:** dedup flavor; static-side refresh behavior; join type; time-range width.
+**Traps:** reading versions that VACUUM has already cleaned; assuming the feed contains history from before you enabled it.
 
-**Done when:** each pattern has a documented state size, latency and correctness result.
+**Done when:** gold matches a full recompute after a series of updates and deletes, using only the change feed.
 
----
-
-## M7. State store and throughput tuning
-
-**Objective:** find limits and tune.
-
-**Do, in order:**
-1. Set the shuffle partition count, start a stateful query, stop it, change the setting and restart from the same checkpoint. Record what happens, and why.
-2. Compare the default state store with the **RocksDB-backed** provider for large state: memory, batch time, checkpoint size.
-3. Raise the producer rate until processing falls behind input; control the backlog with files-per-trigger and trigger interval.
-4. Chart batch duration against trigger interval from the recent progress records.
-5. Find the maximum sustainable rate on your cluster and what limits it (CPU, RustFS, commits, state).
-
-**Done when:** you have a maximum sustainable rate per query and know the first bottleneck.
+**Read more:** Delta change data feed https://docs.delta.io/latest/delta-change-data-feed.html | Delta streaming (reading from a Delta table; skipping change commits) https://docs.delta.io/latest/delta-streaming.html
 
 ---
 
-## M8. Failure and evolution drills
+## M6. Failure drills and recovery
 
 **Objective:** a recovery runbook.
 
-**Do, in order:** inject each and record behavior, recovery steps, and any data effect.
+**Do, in order:** inject each failure, predict the outcome first, then record behavior, recovery steps and any data effect.
 
-| Failure or change | What to verify |
+| Failure | What to verify |
 |---|---|
 | Kill a worker | executor loss, retries, no data loss |
-| Stop the notebook kernel (driver dies) | restart from checkpoint, exact resume |
-| Stop RustFS during a batch | error, retry, checkpoint and table state |
-| Stop Postgres during CDC polling | resumes without gaps or duplicates |
-| Add a column to the sink table while running | does the stream continue? |
-| Change the aggregation key or output mode | which errors appear? |
-| Damage part of the checkpoint | what recovery is possible? |
+| Stop the notebook kernel (the driver dies) | restart from checkpoint; exact resume; no duplicates |
+| Stop RustFS during a batch | error, retry; checkpoint and table state afterward |
+| Stop Postgres during change-log polling | resumes without gaps or duplicates |
+| Change the query (add a column, change the aggregation key) | which changes are allowed with the old checkpoint, which errors appear |
 
-**Done when:** each drill's outcome matches your prediction, or the surprise is documented.
+**Done when:** each outcome matches your prediction, or the surprise is documented.
+
+**Read more:** Structured Streaming guide (recovery semantics) https://spark.apache.org/docs/latest/structured-streaming-programming-guide.html
 
 ---
 
-## M9. Latency and service levels
+## M7. Latency and service levels
 
 **Objective:** measure freshness end to end.
 
 **Do, in order:**
-1. Mark a test change in Postgres and track when it appears in the change log, in the micro-batch, in silver, and in gold.
-2. Break the total into stages (poll, batch wait, processing, commit, visibility) and chart each.
+1. Mark a test change in Postgres and track it: appears in the change log, in the micro-batch, in silver, in gold. Record the time at each point.
+2. Break the total into stages: polling delay, waiting for the next batch, processing, commit, visibility to readers.
 3. Compare latency at low, medium and high rates.
-4. Write **checks** for each service level (freshness lag, row-count differences versus batch truth, duplicate checks) and test that they fire when you break something.
+4. Write **checks** for each service level (freshness lag, row-count differences versus batch truth, duplicate counts) and confirm they fire when you deliberately break something.
 5. Decide alert thresholds.
 
 **Done when:** freshness is measured per stage and your checks alert correctly.
 
 ---
 
-## M10. Synthesis: the operating guide
+## Depth (optional)
 
-Document: topology, rates and limits, maintenance schedule, recovery steps, service levels with their checks, and what you'd monitor in production. Link each rule to an experiment id.
+- **Maintenance while streaming:** run OPTIMIZE (stream-safe) and later VACUUM against a streaming sink. **Remember the single-writer rule:** run maintenance inside the same application as the stream (another thread or query in the same session), or while the stream is stopped, never as a second application. A stream that lags behind the VACUUM retention can lose the files it still needs.
+- **Dedup and joins:** deduplicate events by id within the watermark; join the stream to a static dimension table; try a stream-to-stream join (views to purchases within a time range) and see why both sides need watermarks.
+- **State tuning:** change shuffle partitions on an existing stateful checkpoint (it won't work, and the error explains why); compare the default state store with the RocksDB-backed one for large state; raise the producer rate until processing falls behind and use a files-per-batch cap.
+
+**Read more:** Delta streaming https://docs.delta.io/latest/delta-streaming.html | Delta optimizations https://docs.delta.io/latest/optimizations-oss.html
+
+---
+
+## M8. The operating guide
+
+Write one document: the topology, rates and limits you measured, the maintenance schedule (and where it runs), recovery steps, service levels with their checks, and what you would monitor in production. Link each rule to an experiment id.
 
 ## Config experiments (summary)
 
 | Knob | Values | Watch |
 |---|---|---|
 | Trigger | 2 s, 10 s, 60 s, available-now | latency vs efficiency |
-| Files per trigger | 1, 2, 10 | backlog, batch size |
+| Files per batch | 1, 2, 10 | backlog |
 | Watermark | 1 min, 10 min, 1 h | state, drops, delay |
-| Shuffle partitions | 8, 16, 32 | batch time, state layout |
-| State store provider | default vs RocksDB | memory, latency |
-| Iceberg sink | fanout, target file size, distribution | small files |
-| Checkpoint location | RustFS vs shared volume | commit latency |
-
-## Stretch goals
-- Add a message broker and log-based CDC; compare latency, ordering guarantees and failure behavior with the polled change log.
-- Expose streaming metrics to a dashboard (batch duration, state size, backlog, freshness).
-- Build a replay-and-compare harness that runs the same input through batch and streaming and asserts identical results.
+| Delta sink | target file size, optimized writes (check) | small files |
+| Checkpoint location | RustFS | commit latency |
 
 ## Exit criteria for Project 5
 1. Silver and gold from the stream equal the batch rebuild on closed periods.

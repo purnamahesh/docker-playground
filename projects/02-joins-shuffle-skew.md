@@ -1,291 +1,281 @@
-# Project 2: Joins, Shuffles and Skew (Instacart)
+# Project 2: Joins, Shuffles and Skew (Instacart, Delta Lake)
+
+> **Before you start:** read `00-start-here.md` once. Use `07-learning-companion.md` (P2 section) for prerequisites, the minimal path, time-boxes, prediction prompts, concept checks, rubric and teach-back. Use `08-debugging-playbook.md` when stuck and `09-reference-answers.md` for expected plans.
 
 ## Goal
 
-Understand how Spark executes joins and aggregations over your lakehouse and your live Postgres source: pick join strategies deliberately, diagnose skew from evidence, fix it several ways, and design tables that make joins cheap.
+Understand how Spark executes joins and aggregations over your Delta tables: choose join strategies deliberately, diagnose skew from evidence, fix it, tame the most expensive query (product pairs), and control how many files your jobs write.
 
-## Work plan (what happens when)
+**Simplified scope:** eight core milestones (M0 to M7) plus an optional Depth block. There is no CDC here, and no bucketing or storage-partitioned joins: Delta Lake does not support bucketed tables, so shuffle-free joins are not available. Instead you reduce join cost with broadcast joins, AQE and good file layout.
 
-| Phase | Milestone | Starts when | Produces |
+## Work plan
+
+| Phase | Milestone | Core? | Produces |
 |---|---|---|---|
-| A | M0 Prepare tables, queries and baselines | Project 1 silver exists (M tier) | join benchmark suite, profile of keys |
-| B | M1 to M2 Plans and strategies | M0 done | baseline plans, strategy comparison |
-| C | M3 Federated joins | Postgres source is live | federation guidance |
-| D | M4 to M5 Skew diagnosis and fixes | strategies understood | skew playbook |
-| E | M6 to M7 Pair explosion and range joins | skew playbook | patterns for the two hardest queries |
-| F | M8 to M9 Partitioning and storage-partitioned joins | tables can be rebuilt | table-design rules |
-| G | M10 to M11 Spill and anti-patterns | all above | failure catalog |
-| H | M12 Synthesis | all above | decision tree document |
+| A | M0 Test bed and baselines | Core | frozen tables, 5 benchmark queries, key profile |
+| B | M1 Reading join plans | Core | annotated plans |
+| C | M2 Join strategies | Core | strategy comparison |
+| D | M3 Diagnosing skew | Core | skew checklist |
+| E | M4 Fixing skew | Core | fix comparison table |
+| F | M5 The pair explosion | Core | co-occurrence method |
+| G | M6 Partitions and output files | Core | file-count rules |
+| H | M7 Memory pressure and spill | Core | spill playbook |
+| I | Depth: federated joins, range joins, anti-patterns | Optional | extra patterns |
+| J | M8 Synthesis | Core | decision tree |
+
+## Terms used in this project
+
+| Term | Meaning |
+|---|---|
+| **Stage / task** | Spark splits a query into stages; each stage runs many tasks (one per partition) in parallel |
+| **Exchange** | the plan operator for a shuffle: data moves across the network so matching keys meet |
+| **Broadcast join** | the small table is copied to every executor so the big table needs no shuffle |
+| **Sort-merge join** | both tables are shuffled by the join key, sorted, then merged; the default for big-big joins |
+| **Shuffle-hash join** | both shuffled, then one side is built into an in-memory hash table |
+| **Skew** | one partition (or key) holds far more data than the others |
+| **Hot key** | a key value that owns a large share of rows (for example bananas) |
+| **Salting** | adding a random suffix to a hot key to spread it across several partitions |
+| **Spill** | when a task runs out of memory and writes intermediate data to disk |
+| **AQE** | adaptive query execution; re-plans at runtime using real sizes |
 
 ---
 
-## M0. Prepare tables, the benchmark suite and the key profile
+## M0. Test bed and baselines
 
-**Objective:** a stable test bed so every result is comparable.
+**Objective:** a stable set of tables and queries so every result is comparable.
+
+**Why it matters:** performance work only means something if the data and the question stay the same while you change one thing. Freezing the inputs turns "it felt faster" into evidence.
 
 **Do, in order:**
-1. **Freeze the data version.** Record the Iceberg snapshot id of every table you'll use (lines, orders, products, aisles, departments, users, stores, price book, payments, events). All experiments must read those snapshots.
-2. **Define the benchmark suite** (run each as the baseline):
+1. **Freeze the data version.** Delta tables are versioned. Write down the current version number of each table you'll use (lines, orders, products, aisles, departments, users, stores, price book). Reading "as of version N" later guarantees identical input.
+2. **Define five benchmark queries** and keep them fixed:
 
 | Id | Question | Tables | What it stresses |
 |---|---|---|---|
 | J1 | Reorder rate by department and aisle | lines x products x aisles x departments | small-dimension joins, aggregation |
-| J2 | Order volume by store and day | orders x users x stores | star join |
-| J3 | Revenue per store per day | lines x orders x price book | big join plus lookup |
-| J4 | Each user's top 10 products | lines x orders | window and aggregation by user |
-| J5 | Product co-occurrence (pairs) | lines x lines | explosion |
-| J6 | Price each line from the effective-dated price book | lines x price book | range join |
-| J7 | Reconcile payments with priced lines | payments x lines | large-large, many-to-many risk |
-| J8 | Join lake lines to live Postgres products and prices | lines x JDBC tables | federation |
+| J2 | Order count by store and day | orders x users x stores | star join |
+| J3 | Each user's top 10 products | lines x orders | window and aggregation by user |
+| J4 | Product pairs bought together | lines x lines | explosion |
+| J5 | Price each line from the effective-dated price book | lines x price book | range join |
 
-3. **Profile the keys** that matter (the share of rows held by the top 1, 10 and 100 keys): product id, aisle, department, store, user, order hour and weekday, basket size per order. Make a table; it predicts where skew will appear.
-4. **Prepare the table variants** you'll need later: lines partitioned by month; lines bucketed on order id (several bucket counts); orders bucketed likewise; a compacted copy of everything, so small-file noise doesn't confuse results.
-5. **Record baselines:** run J1 to J8 with defaults, twice each, and log time, shuffle bytes, spill, task counts and plan fingerprint.
+3. **Profile the keys** that matter. For each (product, aisle, department, store, user, hour, basket size) compute the share of rows held by the top 1, top 10 and top 100 values. *Good result:* a table like the one below; it predicts where skew will appear.
 
-**Options to explore:** none yet; this milestone is about control.
+| Key | Distinct values | Top 1 share | Top 10 share | Expectation |
+|---|---|---|---|---|
+| product_id (illustrative) | ~50k | ~1.5% | ~8% | mild to moderate skew |
+| department_id | 21 | ~30% (produce) | ~95% | strong, low-cardinality skew |
+| user_id | ~206k | ~0.05% | small | none, except the injected bulk buyer (~5%) |
 
-**Done when:** every query has a baseline and a recorded plan; the key-skew table exists; table variants are built and compacted.
+4. **Prepare two table variants:** (a) lines as a single Delta table partitioned by month (via a generated date column), (b) lines unpartitioned. Run OPTIMIZE on both so small-file noise doesn't distort results.
+5. **Record baselines:** run J1 to J5 with default settings, twice each. Log time, shuffle bytes, spill, task count and the plan's join types.
+
+**Done when:** every query has a baseline and a recorded plan; the key table exists; both variants exist and are compacted.
+
+**Read more:** Spark web UI guide https://spark.apache.org/docs/latest/web-ui.html | Delta time travel and history https://docs.delta.io/latest/delta-batch.html | Delta OPTIMIZE https://docs.delta.io/latest/optimizations-oss.html
 
 ---
 
-## M1. Reading baseline plans
+## M1. Reading join plans
 
-**Objective:** be able to explain every operator in the join plans.
+**Objective:** explain every operator in a join plan.
+
+**Why it matters:** you can't fix what you can't read. A plan is a tree of operators; the leaves are scans, the root is the result. For joins, the questions are: which join type, how many exchanges, and what was filtered before the join.
 
 **Do, in order:**
-1. For J1 to J4, read the formatted plan top-down and annotate: scan (what was pushed), join type, exchange (what key, how many partitions), sort, aggregate (partial and final).
-2. **Predict then check:** for each join, write down the join type you expect and why (sizes versus the broadcast limit), then compare.
-3. **Force the alternative.** Disable auto-broadcast and AQE and re-run to get sort-merge plans. Count exchanges and sorts and compare time.
-4. **Re-enable AQE** and find what changed at runtime in the final adaptive plan (join switch, coalesced partitions, local reader).
-5. Note how Iceberg scans appear and which filters were pushed into them.
+1. For J1 to J3, print the formatted plan and annotate each node in your notes: scan (columns read, filters pushed), join type, exchange (which key, how many partitions), sort, aggregate (partial then final).
+2. **Predict first:** for each join, write down the expected join type and why, using table sizes versus the broadcast limit (default 10 MB).
+3. **Force the alternative:** disable auto-broadcast and AQE, rerun, and count exchanges and sorts. *Expected:* more exchanges and a slower run.
+4. **Re-enable AQE** and look at the *final* adaptive plan: did a join switch? Were partitions coalesced?
+5. Note how a Delta scan looks in the plan (partition filters, pushed filters, file count) and compare with the number of files in the table detail.
 
-**Record:** per query: join types, number of exchanges, shuffle bytes, partitions before and after coalescing.
+**Traps:** reading only the initial plan (AQE may change it at runtime); assuming a filter in the plan was applied at the source.
 
-**Traps:** reading only the initial plan; AQE changes the plan at runtime, so the final plan is what ran.
+**Done when:** at least 80% of your join-type predictions were right and you can explain each miss.
 
-**Done when:** you correctly predicted join types for at least 80% of joins and can explain the mismatches.
+**Read more:** Spark SQL performance tuning (joins, hints, AQE) https://spark.apache.org/docs/latest/sql-performance-tuning.html | EXPLAIN https://spark.apache.org/docs/latest/sql-ref-syntax-qry-explain.html
 
 ---
 
-## M2. Join strategies by hint
+## M2. Join strategies
 
 **Objective:** know when each strategy wins and what it costs.
 
+**Why it matters:** the same join can take 20 seconds or 5 minutes depending on strategy. Strategy depends on table sizes, not on your intentions.
+
 **Do, in order:**
-1. For the product, aisle and department joins (small right sides), force each strategy by hint and compare.
-2. Measure **broadcast limits:** find the largest table you can broadcast given driver memory and the broadcast timeout. Note the symptoms near the limit (slow collect, timeouts). Don't push into failure at L scale.
-3. Compare **shuffle-hash vs sort-merge** where the build side fits in memory: time, memory per task, spill.
-4. Explore the **nested-loop** hint only on tiny inputs, to see what it does.
-5. Change the build side by swapping table order or hints and observe.
+1. On J1 (lines joined to small tables), run each of: broadcast, sort-merge, shuffle-hash (force each with a hint). Record time, shuffle bytes and spill.
+2. **Find the broadcast limit.** Make the dimension side bigger step by step (50k rows, 500k, 5M, using a synthetic copy). Note where driver memory or the broadcast timeout starts to hurt. *Why:* a broadcast table is collected on the driver and sent to every executor.
+3. Compare **shuffle-hash vs sort-merge** where the build side fits memory.
+4. Swap the table order or hints and see whether the build side changes.
 
 **Options to explore:**
 
 | Variable | Values | Watch |
 |---|---|---|
 | Strategy | broadcast / sort-merge / shuffle-hash | time, shuffle bytes, spill, driver memory |
-| Table size on the broadcast side | 50k rows, 1M rows, 5M rows | memory, time to collect |
-| Auto-broadcast threshold | disabled, 10 MB, 100 MB | what gets chosen automatically |
-| Build side choice | each side | memory per task |
+| Dimension size | 50k, 500k, 5M rows | where broadcast stops being safe |
+| Auto-broadcast threshold | disabled / 10 MB / 100 MB | which strategy Spark chooses |
 
-**Traps:** broadcasting a table that's small on disk but large in memory; a hint silently ignored when the join type or conditions don't allow it (check the plan).
+**Traps:** broadcasting a table that is small on disk but large in memory; a hint silently ignored if the join type doesn't allow it (check the plan).
 
-**Done when:** you have a table giving, for each query, the best strategy and the margin over the default.
+**Done when:** you can state the best strategy for J1 with evidence and its margin over the default.
+
+**Read more:** Join hints https://spark.apache.org/docs/latest/sql-ref-syntax-qry-select-hints.html | Spark SQL performance tuning https://spark.apache.org/docs/latest/sql-performance-tuning.html
 
 ---
 
-## M3. Federated joins (lake x Postgres)
+## M3. Diagnosing skew
 
-**Objective:** decide when joining against the live source is acceptable.
+**Objective:** recognize skew from the Spark UI in under a minute.
+
+**Why it matters:** a stage finishes only when its slowest task finishes. With one hot key, one task may do 40 times the work of the rest while seven cores sit idle.
 
 **Do, in order:**
-1. Run J8 as a plain join of lake lines against JDBC products and price book.
-2. Read the plan: which filters and columns reached Postgres, and what Spark pulled across.
-3. Run it twice and see that Postgres is hit **again** each time (no caching).
-4. Try the alternatives: cache the JDBC read; broadcast it; snapshot it into Iceberg first and join there; push the join into Postgres through a subquery.
-5. Observe Postgres: connections, queries, load, locks.
-6. Compare selective and unselective cases (a few products vs all).
-7. Write a rule: when is federation fine (small, selective, tolerable staleness) and when must you snapshot?
+1. Run an aggregation and a join on product id, then on department, then (if present) on the bulk buyer's user id.
+2. For each, open the Stages tab and record for the slow stage: task duration min / median / max, the shuffle read of the largest task versus the median, and spill.
+3. Compute **max divided by median**. Rough guide: under 2 is fine; 3 to 10 is noticeable; above 10 is skew.
+4. Show skew in three places: a join, an aggregation, a window by user.
+5. Contrast **high-cardinality skew** (one hot product among 50k) with **low-cardinality skew** (21 departments spread across many partitions): in the second case many partitions are simply empty.
+6. Write a **skew checklist** (UI signals plus key-profile signals).
+
+**Worked example (illustrative):**
+
+| Key | Query | Max task | Median task | Ratio | Spill | Diagnosis |
+|---|---|---|---|---|---|---|
+| product_id | join with lines | 160 s | 11 s | 14.5 | one task, 3 GB | hot product |
+| department_id | aggregate | 45 s | 40 s | 1.1 | none | low-cardinality, not skewed per task |
+| user_id | window | 12 s | 9 s | 1.3 | none | no skew |
+
+**Traps:** confusing input skew (uneven files) with key skew; judging by total time instead of the task distribution.
+
+**Done when:** from the UI alone you can say which of the three situations a stage is in.
+
+**Read more:** Web UI (stages and tasks) https://spark.apache.org/docs/latest/web-ui.html | Tuning guide https://spark.apache.org/docs/latest/tuning.html
+
+---
+
+## M4. Fixing skew
+
+**Objective:** pick the right fix for a join, an aggregation and a MERGE, with evidence.
+
+**Do, in order**, using one skewed query (reorder rate per product joined back to lines):
+1. **AQE skew handling.** Lower the size thresholds so it triggers on lab-sized data; find the skew marker in the plan; explain what Spark split. Note where it doesn't apply (aggregations).
+2. **Salting.** Add a random number from 0 to N-1 to the big side's key, replicate the small side N times, and join on key plus salt. For aggregations: aggregate by key plus salt first, then by key. Try N = 4, 8, 32.
+3. **Hot-key isolation.** Find the top K keys; broadcast-join those rows; shuffle-join the rest; combine the results.
+4. Build a comparison table: time, max/median ratio, shuffle bytes, spill, complexity.
+5. **Optional:** pre-aggregate before the join (for example to product and day).
+
+**Salting example (illustrative):** key "banana" owns 10% of rows. With N = 8, it becomes "banana_0" to "banana_7", each holding about 1.25%, so eight tasks share the work. The small side must contain all eight versions.
 
 **Options to explore:**
 
-| Approach | Pro | Con |
+| Fix | Works for | Doesn't help |
 |---|---|---|
-| Direct join | always fresh | repeated load on Postgres |
-| Cached read | one load | stale; memory |
-| Snapshot to Iceberg | cheapest repeated use | extra pipeline and delay |
-| Join inside Postgres | less data moved | Postgres CPU; limited functions |
+| AQE skew handling | sort-merge joins | aggregations |
+| Salting | joins and aggregations | adds complexity and copies the small side |
+| Hot-key isolation | a few very hot keys | many moderately hot keys |
 
-**Done when:** you can state the break-even (queries per hour, data volume) for each approach.
+**Done when:** you chose a fix for a join, an aggregation and a MERGE and can show the numbers.
+
+**Read more:** Spark SQL performance tuning (AQE skew join) https://spark.apache.org/docs/latest/sql-performance-tuning.html | Delta MERGE https://docs.delta.io/latest/delta-update.html
 
 ---
 
-## M4. Diagnosing skew
+## M5. The pair explosion (products bought together)
 
-**Objective:** recognize skew from the UI in under a minute.
+**Objective:** run the most expensive query and know what each shortcut changes.
+
+**Why it matters:** joining lines to itself on order id creates one row per pair of items in the same order. Pair count grows with the **square** of basket size, so a few huge baskets dominate.
+
+**Worked example:** pairs in one basket = n x (n - 1) / 2.
+
+| Basket size | Pairs |
+|---|---|
+| 5 | 10 |
+| 10 | 45 |
+| 50 | 1,225 |
+| 100 | 4,950 |
+
+One basket of 100 items creates as many pairs as 110 baskets of 10.
 
 **Do, in order:**
-1. Run aggregations and joins on each candidate key: product id, department, aisle, store, hour, and the injected bulk buyer.
-2. For each, open the Stages tab and record task duration (min, median, max), shuffle read of the slowest task versus the median, and spill.
-3. Show skew in **four places:** a join, a window by user, a MERGE where the source has many rows for one key, and JDBC partitions with uneven row counts.
-4. Contrast **high-cardinality skew** (a hot product) with **low-cardinality skew** (21 departments across many partitions): what happens to idle partitions?
-5. Build a skew checklist: signals in the UI, signals in the key profile.
+1. **Predict the total pair count** from your basket-size distribution (sum over orders of n x (n - 1) / 2). Write the number down.
+2. **Run on a small sample** to check your prediction; then measure on M if feasible.
+3. Explain why a few huge baskets dominate shuffle size, spill and task times.
+4. **Try fixes** and record each: (a) cap or sample huge baskets; (b) keep only frequent products before pairing (prune first); (c) pair in a canonical order (product A < product B) to halve the work.
+5. Mark each fix: **changes the answer** (caps, sampling, pruning) or **changes only the plan** (canonical order).
 
-**Record:** a table with key, query, max/median ratio, spill, and diagnosis.
+**Done when:** two methods produce the same top pairs, with the cost and accuracy trade-off documented.
 
-**Traps:** skew in the **input** (uneven file splits) is different from skew in the **shuffle key**; salting the wrong one helps nothing.
-
-**Done when:** you can identify the cause from the UI alone for each of the four cases.
+**Read more:** Market basket analysis background https://en.wikipedia.org/wiki/Association_rule_learning
 
 ---
 
-## M5. The skew-fix ladder
+## M6. Partitions and output files
 
-**Objective:** choose the right fix per situation, with evidence.
+**Objective:** control task counts and how many files your jobs write.
 
-**Do, in order**, using one skewed query (reorder rate per product joined back to lines) and then repeat for an aggregation and a MERGE:
-1. **AQE skew handling:** lower the size thresholds so it triggers on lab data; find the skew markers in the plan; explain what was split. Note where it does **not** apply.
-2. **Salting:** salt the large side and replicate the small side; sweep the salt factor; for aggregations use two phases.
-3. **Hot-key isolation:** find the top keys; broadcast-join them; shuffle-join the rest; union the results.
-4. **Pre-aggregation:** reduce rows before the join (for example to one row per product and day).
-5. **Data-model fix:** push the join earlier or avoid it by denormalizing the dimension into the lines table.
-6. Compare all fixes in one table.
-
-**Options to explore:**
-
-| Fix | Parameters | Works for | Doesn't help |
-|---|---|---|---|
-| AQE skew | factor, size threshold | sort-merge joins | skewed aggregations |
-| Salting | factor 4, 8, 32 | joins, aggregations | adds complexity, replicates data |
-| Hot-key isolation | top K keys | joins with a few hot keys | many moderately hot keys |
-| Pre-aggregation | grain | aggregations feeding joins | when you need detail rows |
-| Denormalize | which dimension | repeated joins | storage and update cost |
-
-**Record:** time, max/median ratio, shuffle bytes, spill, and implementation complexity per fix.
-
-**Done when:** you can state which fix you'd pick for a join, an aggregation and a MERGE, and give the evidence.
-
----
-
-## M6. Pair explosion (co-occurrence)
-
-**Objective:** make the most expensive query run, and know what each shortcut changes.
+**Concepts:** the number of **shuffle partitions** decides how many tasks run after a shuffle. Too few = huge tasks that spill; too many = thousands of tiny tasks and tiny output files. By default Spark uses 200; on 8 cores you usually want far fewer, and AQE can merge small partitions automatically.
 
 **Do, in order:**
-1. **Predict** the pair count from the basket-size distribution (sum over baskets of size times size minus one, divided by two for unordered pairs).
-2. **Run on a small sample** to check the prediction, then measure on M if feasible.
-3. Explain why a few huge baskets dominate the pair count and what that does to shuffle size, spill and task durations.
-4. **Try fixes** in turn:
-   - cap or sample huge baskets;
-   - restrict to frequent products before pairing (prune first);
-   - use a canonical pair order to halve the work;
-   - pre-aggregate per pair in partial steps;
-   - split by department and combine.
-5. Mark each fix as **changes the answer** (sampling, caps) or **changes only the plan**.
+1. With AQE **off**, sweep shuffle partitions (8, 16, 64, 200, 1000) on J1 and J3 and plot time against partitions.
+2. With AQE **on**, vary the advisory partition size (16 MB, 64 MB, 256 MB) and find the "coalesced" partition counts in the plan.
+3. **Output files:** write the same data with different settings (repartition to 8, to 64; AQE on and off). Count files per table partition and their sizes from the table detail and the RustFS console. If your Delta version supports optimized writes or auto-compaction, compare them (check availability).
+4. Run OPTIMIZE and see how files change; remember it creates new files (old ones remain until VACUUM).
+5. Write down the relationship: shuffle partitions x table partitions decides output file count.
 
-**Done when:** you have the same top pairs from at least two methods, with a documented difference in cost and accuracy.
+**Done when:** you can predict the number of files a write will create before running it.
+
+**Read more:** Spark SQL performance tuning (AQE coalescing) https://spark.apache.org/docs/latest/sql-performance-tuning.html | Delta optimizations https://docs.delta.io/latest/optimizations-oss.html
 
 ---
 
-## M7. Range joins on prices and promotions
+## M7. Memory pressure and spill
 
-**Objective:** replace an expensive non-equi join with something that scales.
+**Objective:** know the early signs of memory trouble and the fixes.
 
 **Do, in order:**
-1. Price each line from the effective-dated price book (order time between valid-from and valid-to) and record the join type (likely nested-loop or an inefficient sort-merge variant).
-2. Try the alternatives: expand the price book to one row per product per day and use an equi-join; bucket time into weeks and join on bucket then filter; as-of style lookup using sorting; broadcast the price book if it fits.
-3. Repeat with the campaign calendar.
-4. Test at M and see which approach survives at L.
+1. Run a large sort or aggregation with small executors (for example 512 MB) and few shuffle partitions. Record spill (memory and disk) and GC time.
+2. Apply one fix at a time and re-measure: (a) more shuffle partitions; (b) fewer cores per executor (more memory per task); (c) a larger execution share of memory; (d) select only needed columns early.
+3. Rank the fixes by effect per effort.
 
-**Options to explore:** raw range join; expanded daily table (storage cost); time-bucket then filter; sorted as-of; broadcast.
+**Rule of thumb:** memory available to one task is roughly executor memory times the usable fraction, divided by cores. Halving cores per executor roughly doubles memory per task.
 
-**Traps:** overlapping validity periods multiplying rows; open-ended intervals.
+**Done when:** you can explain each spill in your runs and name the fix that addressed it.
 
-**Done when:** one approach runs in reasonable time at the L tier, with a verified identical result to the raw range join on a sample.
-
----
-
-## M8. Partition sizing and write distribution
-
-**Objective:** control task counts and output file counts.
-
-**Do, in order:**
-1. With AQE **off**, sweep `spark.sql.shuffle.partitions` (8 to 1000) on J1, J3 and J4 and plot time versus partitions.
-2. With AQE **on**, vary the advisory partition size and find the coalesced-read nodes; compare final partition counts.
-3. On the Iceberg **write path**, insert the same data with each distribution mode (none, hash, range), record shuffle cost, file counts per partition and file sizes.
-4. Combine: shuffle partitions times distribution mode times table partitioning decides output file counts; write the relationship in your own words and test it.
-
-**Done when:** you can predict the file count of a write before running it.
+**Read more:** Tuning guide (memory management) https://spark.apache.org/docs/latest/tuning.html
 
 ---
 
-## M9. Storage-partitioned joins
+## Depth (optional): three extra patterns
 
-**Objective:** remove shuffles by design.
+Do these only after the core path.
 
-**Do, in order:**
-1. Build orders and lines **bucketed identically on order id** with the same bucket count.
-2. Enable the Spark and Iceberg settings required (check the Iceberg docs for your version).
-3. Confirm the plan has **no exchange** on either side; compare time with a regular join.
-4. **Break it on purpose:** different bucket counts; an extra partition column; a different join key; one side unbucketed. Record which cases still avoid a shuffle.
-5. Compare with the older Hive-style bucketing.
-6. Consider the cost: bucketing is decided at design time and affects writes.
+**D1. Federated joins (lake x Postgres).** Join a lake table to a live Postgres table. Look at what Spark pushes to Postgres, and rerun to see Postgres is hit again each time (no caching). Compare caching the read, broadcasting it, or copying it to Delta first. Rule: federation is fine for small, selective, fresh-data needs; otherwise copy.
 
-**Done when:** you have a list of conditions under which the optimization applies and a recommended bucket count for your data.
+**D2. Range joins.** Pricing each line from an effective-dated price book needs a "date between valid_from and valid_to" join, which is slow. Compare the raw range join with an expanded price table (one row per product per day) joined by equality.
+
+**D3. Anti-patterns to read about:** joins on expressions (for example a lowercased name), `distinct` before a join, a missing join condition creating a Cartesian product, a whole-history window that could be bounded, a join key with mismatched types causing casts.
+
+**Read more:** Spark JDBC https://spark.apache.org/docs/latest/sql-data-sources-jdbc.html
 
 ---
 
-## M10. Memory pressure and spill
+## M8. Synthesis: the decision tree
 
-**Objective:** know the early signs and the fixes.
-
-**Do, in order:**
-1. Run a large sort, aggregation and merge with small executors and few shuffle partitions; record spill (memory and disk) and GC.
-2. Apply fixes one at a time: more partitions; fewer cores per executor (more memory per task); a larger execution share of memory; reduce row width by projecting early.
-3. Repeat for a merge on a large target; compare copy-on-write and merge-on-read memory behavior.
-4. Rank the fixes by effect per effort.
-
-**Done when:** you can explain each spill in a run and say which fix addressed it.
-
----
-
-## M11. Anti-pattern gallery
-
-**Objective:** a catalog of plans that look fine but aren't.
-
-**Do, in order:** on small samples, read the plans for each and note the failure mode and the fix:
-- non-equi join and joins on expressions (for example a normalized product name);
-- `distinct` before a join;
-- a Cartesian product from a missing condition;
-- a window across a whole user history that could be bounded;
-- an unnecessary sort or repartition before a write;
-- a join key with mismatched types causing casts.
-
-**Done when:** each pattern has a plan screenshot or description, the symptom and the fix.
-
----
-
-## M12. Synthesis: the decision tree
-
-Produce a one-page decision tree: given table sizes, key skew, join type and freshness needs, which strategy, which settings, which table design. Include the evidence (experiment ids) behind each branch.
+Write a one-page decision tree: given table sizes, key skew, join type and freshness needs, which strategy, which settings, which layout. Attach the experiment ids behind each branch.
 
 ## Config experiments (summary)
 
 | Knob | Values | Watch |
 |---|---|---|
 | auto-broadcast threshold | disabled, 10 MB, 100 MB | join type |
-| AQE (overall, coalesce, skew, local reader) | on/off, thresholds | plan changes |
+| AQE (overall, coalesce, skew) | on/off, thresholds | plan changes |
 | shuffle partitions | 8 to 1000 | overhead vs spill |
 | advisory partition size | 16 MB to 256 MB | coalesced partitions |
-| executor cores | 1, 2 | memory per task |
-| Iceberg distribution mode | none, hash, range | shuffle, file counts |
-| bucket count | 8, 16, 32 | eligibility of storage-partitioned joins |
-
-## Stretch goals
-- Compare skew handling with the RDD API and a custom partitioner.
-- Build a skew-report helper: top keys, share of rows, recommended technique.
-- Measure how the bulk buyer changes Iceberg write distribution.
+| executor cores and memory | 1 or 2 cores, 512 MB to 2 GB | spill |
 
 ## Exit criteria for Project 2
 1. You predicted join types and skew locations before running.
 2. Each fix has numbers behind it.
-3. You can design a table (partitioning, buckets, sort) to make a given join cheap.
+3. You can predict output file counts and explain spill.

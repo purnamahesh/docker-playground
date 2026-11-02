@@ -1,270 +1,260 @@
-# Project 4: Executors, Memory and I/O Performance (Instacart)
+# Project 4: Executors, Memory and I/O Performance (Instacart, Delta Lake)
+
+> **Before you start:** read `00-start-here.md` once. Use `07-learning-companion.md` (P4 section) for prerequisites, the minimal path, time-boxes, prediction prompts, concept checks, rubric and teach-back. Use `08-debugging-playbook.md` when stuck and `09-reference-answers.md` for magnitude calibration.
 
 ## Goal
 
-Build a capacity model for your platform by testing, in a deliberate order: executor layout, memory behavior, serialization, Python performance, object-store (S3A) behavior against RustFS, JDBC concurrency against Postgres, Iceberg commit conflicts, scheduling and failure recovery.
+Build a capacity model for your platform by testing, in a deliberate order: executor layout, memory behavior, Python performance, object-store (S3A) behavior against RustFS, JDBC concurrency against Postgres, failure recovery, and the rules for writing Delta tables safely.
 
-## Work plan (what happens when)
+**Simplified scope:** eight core milestones (M0 to M7) plus an optional Depth block. No CDC in this project.
 
-| Phase | Milestone | Starts when | Produces |
+## Work plan
+
+| Phase | Milestone | Core? | Produces |
 |---|---|---|---|
-| A | M0 Workloads and baselines | gold and silver exist | six reference workloads |
-| B | M1 Topology and scaling | M0 done | scaling curves, bottleneck diagnosis |
-| C | M2 to M3 Memory and serialization | M1 done | memory settings guidance |
-| D | M4 Python UDF ladder | M0 done | UDF decision table |
-| E | M5 Object-store tuning | M1 done | S3A and file-size guidance |
-| F | M6 JDBC concurrency | Postgres live | connection policy |
-| G | M7 Concurrent writers | tables exist | conflict playbook |
-| H | M8 Scheduling and dynamic allocation | M1 done | scheduling rules |
-| I | M9 to M10 Failures and shuffle internals | all above | recovery notes |
-| J | M11 Capacity model | all above | final model |
+| A | M0 Workloads and baselines | Core | four reference workloads |
+| B | M1 Executor layout and scaling | Core | scaling curves, bottleneck diagnosis |
+| C | M2 Memory and spill | Core | memory guidance |
+| D | M3 Python UDF ladder | Core | UDF decision table |
+| E | M4 Object storage and file size | Core | S3A and file-size guidance |
+| F | M5 JDBC concurrency | Core | Postgres connection policy |
+| G | M6 Failures and recovery | Core | failure runbook |
+| H | M7 Delta writer rules | Core | safe job combinations |
+| I | Depth: serialization, scheduling, shuffle files, speculation | Optional | extra notes |
+| J | M8 Capacity model | Core | final model |
+
+## Terms used in this project
+
+| Term | Meaning |
+|---|---|
+| **Executor** | a JVM process on a worker that runs tasks and holds cached data |
+| **Core / task slot** | one task runs per core at a time |
+| **Strong scaling** | same job, more cores: how much faster does it get? |
+| **Speedup / efficiency** | speedup = time on 1 core / time on n cores; efficiency = speedup / n |
+| **Bottleneck** | the resource that limits throughput: CPU, memory, storage, source database, or network |
+| **Execution vs storage memory** | execution = shuffles, joins, sorts; storage = cached data. They share one pool |
+| **Spill** | writing intermediate data to disk because memory ran out |
+| **GC** | JVM garbage collection; high GC time means too many objects or too little heap |
+| **OCC** | optimistic concurrency control: writers don't lock; conflicts are detected at commit |
 
 ---
 
-## M0. Reference workloads and baselines
+## M0. Workloads and baselines
 
-**Objective:** six fixed workloads that stress different resources.
+**Objective:** four fixed workloads that stress different resources, each with a stable baseline.
 
 **Do, in order:**
-1. **Define the workloads** (all on the M tier; use L when you need pressure):
+1. **Define the workloads** (M tier; L when you want pressure):
 
 | Id | Workload | Mainly stresses |
 |---|---|---|
 | W1 | scan-heavy: read lines, filter, count by product | storage throughput, request count |
-| W2 | shuffle-heavy: aggregate lines by user and product, join to orders | network, disk, shuffle settings |
-| W3 | CPU-heavy: per-line reorder-propensity score (math) | CPU, Python overhead |
+| W2 | shuffle-heavy: aggregate lines by user and product, join to orders | network, disk, shuffle |
+| W3 | CPU-heavy: a per-line score computed with a Python function | CPU, Python overhead |
 | W4 | memory-heavy: cache lines, then run wide aggregations | memory, GC, spill |
-| W5 | write-heavy: rewrite lines with a new layout | write path, commit, file counts |
-| W6 | mixed: the full user-feature build (cadence, reorder ratio, basket stats, department vectors, next-basket candidates) | everything |
 
-2. **Instrument each run** with the four views from the README (Spark UI, Iceberg metadata, RustFS, Postgres) plus host CPU, memory and disk I/O.
-3. **Record baselines** with the default layout (2 cores and 1 GB per executor, all 8 cores), twice each.
-4. **Classify each workload** by its apparent bottleneck, to be tested later.
+2. **Instrument every run** with the four views plus host CPU, memory and disk use.
+3. **Record baselines** with the default layout, twice each.
+4. **Classify** each workload by its apparent bottleneck (to be tested).
 
-**Done when:** each workload has a stable baseline (variation under 10% between runs) and a first guess at its bottleneck.
+**Done when:** each workload has a stable baseline (variation under 10%) and a first guess at its bottleneck.
+
+**Read more:** Spark web UI guide https://spark.apache.org/docs/latest/web-ui.html | Monitoring https://spark.apache.org/docs/latest/monitoring.html
 
 ---
 
-## M1. Executor topology and strong scaling
+## M1. Executor layout and strong scaling
 
-**Objective:** find the best layout and the point where adding cores stops helping.
+**Objective:** find the best layout and the point where more cores stop helping.
+
+**Why it matters:** 8 cores can be arranged as 4 executors with 2 cores, or 8 executors with 1 core, and memory per task changes accordingly. More cores only help while CPU is the limit; after that something else (storage, the source database, the driver) is.
 
 **Do, in order:**
-1. **Layout matrix** (new session each time; verify in the Executors tab):
+1. **Try layouts** (new session each time; verify in the Executors tab): 4 x (2 cores, 1 GB); 8 x (1 core, 1 GB); 4 x (2 cores, 2 GB).
+2. Run W1 to W4 on each; record time, spill and GC.
+3. **Strong scaling:** for each workload, run with 1, 2, 4 and 8 total cores. Compute speedup and efficiency.
+4. **Diagnose the flat part:** compare executor CPU, RustFS throughput and Postgres load to decide whether the job is **CPU-bound, storage-bound, source-bound or shuffle-bound**.
 
-| Layout | Cores x memory |
-|---|---|
-| 4 executors | 2 cores x 1 GB |
-| 8 executors | 1 core x 1 GB |
-| 4 executors | 2 cores x 2 GB |
-| 8 executors | 1 core x 512 MB |
+**Worked example (illustrative):**
 
-2. Run W1 to W4 on each layout and record time, spill and GC.
-3. **Strong scaling:** for each workload, run with total cores of 1, 2, 4 and 8; compute speedup and efficiency; find where it flattens.
-4. **Diagnose the flat part.** Compare executor CPU usage, RustFS throughput and Postgres load to decide whether the job is **CPU-bound, storage-bound, source-bound or shuffle-bound**.
-5. Compare the best layout for a shuffle-heavy workload and a scan-heavy workload.
-6. Note memory per task for each layout (executor memory divided by cores).
+| Cores | Time | Speedup | Efficiency |
+|---|---|---|---|
+| 1 | 400 s | 1.0 | 100% |
+| 2 | 205 s | 1.95 | 98% |
+| 4 | 108 s | 3.7 | 93% |
+| 8 | 98 s | 4.1 | 51% (RustFS throughput is saturated: storage-bound) |
 
 **Traps:** one-core executors duplicate JVM overhead and broadcast data; two-core executors share memory between tasks; a flat curve may be storage, not Spark.
 
 **Done when:** a scaling curve exists for each workload and each has a named bottleneck.
 
+**Read more:** Spark standalone https://spark.apache.org/docs/latest/spark-standalone.html | Amdahl's law (why curves flatten) https://en.wikipedia.org/wiki/Amdahl%27s_law
+
 ---
 
-## M2. Memory model
+## M2. Memory and spill
 
-**Objective:** know how Spark uses its heap and what to change when it struggles.
+**Objective:** recognize memory trouble in the UI and know what to change.
+
+**Concepts:** each executor's heap is split: a small reserved part, and a unified pool (default 60%) shared by execution (shuffles, joins, sorts) and storage (cache). If a task needs more execution memory than it has, it **spills** to disk (slow but safe). If even that fails, you get an out-of-memory error.
 
 **Do, in order:**
 1. Read the Executors tab: storage memory, execution memory, GC time per task.
-2. Run W4 (cache then aggregate). Record cached fraction, spill and GC share.
+2. Run W4; record cached fraction, spill, GC share.
 3. **Sweep one setting at a time:**
 
 | Setting | Values | Watch |
 |---|---|---|
-| `spark.memory.fraction` | 0.4, 0.6, 0.8 | spill, GC |
-| `spark.memory.storageFraction` | 0.2, 0.5, 0.8 | cached fraction, eviction |
-| Off-heap memory | off, on with a fixed size | GC share |
-| GC algorithm (via executor Java options) | default, parallel | pause time, throughput |
+| Memory fraction | 0.4, 0.6, 0.8 | spill, GC |
+| Storage fraction | 0.2, 0.5, 0.8 | cached fraction, eviction |
 | Executor memory | 512m, 1g, 2g | spill, failures |
 
-4. Cause an **out-of-memory** failure deliberately (small executors, big partitions) and read the error and the UI to learn the signature.
-5. Note that the memory-overhead setting is **not enforced** in standalone mode; record what that implies on YARN or Kubernetes.
+4. **Cause an out-of-memory failure on purpose** (small executors, big partitions) and read the error and the UI to learn its signature.
+5. Note that the memory-overhead setting is **not enforced** in standalone mode; the container limit (Docker) can still kill an executor (exit code 137).
 
-**Done when:** you can look at a task's metrics and say whether memory, GC or spill is the issue and what to change.
+**Done when:** from task metrics you can say whether memory, GC or spill is the issue and what to change.
 
----
-
-## M3. Serialization and the RDD API
-
-**Objective:** understand where serialization settings matter.
-
-**Do, in order:**
-1. Run the same aggregation three ways and compare shuffle bytes and time: group-by-key, reduce-by-key (or aggregate-by-key), and the DataFrame aggregation.
-2. Switch the serializer and repeat; explain why DataFrame jobs barely change while RDD jobs do.
-3. Compare **persistence levels** on an RDD and a DataFrame cache (memory only, serialized, memory and disk, disk only).
-4. Compare **shuffle compression codecs** (lz4, zstd, snappy) on W2.
-5. Compare shuffle buffer settings.
-
-**Done when:** you have rules for when RDD tricks help and when to stay with DataFrames.
+**Read more:** Tuning guide (memory management, GC) https://spark.apache.org/docs/latest/tuning.html
 
 ---
 
-## M4. The Python UDF performance ladder
+## M3. The Python UDF ladder
 
-**Objective:** pick the right level of Python integration per task.
+**Objective:** choose the right level of Python integration for a task.
+
+**Why it matters:** a Python function called once per row crosses the JVM-to-Python boundary for every row, which is slow. Batched approaches move many rows at once.
 
 **Do, in order:**
-1. **Choose two per-row computations:** a math-heavy reorder-propensity score from recency and frequency features, and a product-name normalization plus tokenization step.
-2. Implement each at every rung and benchmark on the M tier with the no-op sink:
+1. **Choose one per-row computation:** a math-heavy reorder-propensity score from recency and frequency features.
+2. Implement it four ways and benchmark each on the M tier with a no-op write:
 
 | Rung | Implementation | Expectation to test |
 |---|---|---|
-| 1 | built-in functions | fastest |
-| 2 | SQL expressions and higher-order functions | close to rung 1 |
-| 3 | row-at-a-time Python UDF | slowest |
-| 4 | Arrow-optimized Python UDF | better than 3 |
-| 5 | pandas UDF | best Python option for math |
-| 6 | map-in-Arrow or map-in-pandas | flexible, batch-based |
-| 7 | RDD map | JVM-to-Python overhead |
+| 1 | built-in functions only | fastest |
+| 2 | plain row-at-a-time Python UDF | slowest |
+| 3 | Arrow-optimized Python UDF (Spark 4.2 enables Arrow-optimized UDFs by default; confirm in your Environment tab) | better than rung 2 |
+| 4 | pandas UDF (vectorized) | best Python option for math |
 
-3. **Sweep** the Arrow batch size, the Python worker memory limit and Python worker reuse.
-4. **Decompose time** into JVM time, serialization and Python time where the UI allows.
-5. **Hot-key trap:** run a grouped pandas computation per user. The injected **bulk buyer** concentrates data into one Python worker; watch memory and task time, then fix it with window functions, or with salting plus two-phase processing.
-6. Test **result correctness** across rungs (identical outputs within tolerance).
+3. Check that all rungs give the same results within tolerance.
+4. **Hot-key trap:** run a grouped pandas computation per user. The injected bulk buyer (about 5% of orders) overloads one Python worker. Watch memory and task time, then fix it with a window function or two-phase processing.
 
-**Done when:** you can say, for any new transformation, which rung to start from and why.
+**Done when:** for any new transformation you can say which rung to start from and why.
+
+**Read more:** PySpark with Arrow and pandas https://spark.apache.org/docs/latest/api/python/user_guide/sql/arrow_pandas.html | Spark ANSI mode https://spark.apache.org/docs/latest/sql-ref-ansi-compliance.html
 
 ---
 
-## M5. Object-store tuning (S3A and Iceberg file I/O against RustFS)
+## M4. Object storage (S3A) and file size
 
 **Objective:** know how storage settings and file layout affect throughput.
 
+**Concepts:** reading from RustFS means many HTTP requests. Each file costs at least one request, so thousands of tiny files are slow even when the data is small. S3A has settings for how many connections and threads it uses.
+
 **Do, in order:**
-1. **Baseline W1 and W5** and measure request counts and throughput at RustFS for a full scan, a filtered scan and a write.
-2. **Sweep S3A settings** one at a time:
-
-| Setting | Values | Watch |
-|---|---|---|
-| connection pool maximum | small, default, large | throughput, errors |
-| thread pool size | small, large | concurrent transfers |
-| fast-upload buffering mode | disk, array, byte buffer | memory, speed |
-| multipart size and threshold | small, large | request count |
-| block size and read-ahead | small, large | scan speed |
-| access-pattern hint | sequential, random, adaptive | columnar reads |
-
-3. **Compare S3A with Iceberg's own S3 file I/O** for the same table: speed, error clarity, credential and endpoint settings.
-4. **File size study:** create the same data at several file sizes and plot throughput versus file size; find where more size stops helping.
-5. Find the setting that governs **Iceberg scan task size** (it differs from the general file-source setting) and sweep it.
-6. Watch for retry storms and timeouts under load; look in RustFS logs.
+1. Baseline W1 and a write job; record request counts and throughput at RustFS for a full scan, a filtered scan and a write.
+2. **Sweep S3A settings** one at a time: connection pool size; thread pool size; upload buffering mode; read-ahead.
+3. **File-size study:** rewrite the same data at several target file sizes (use OPTIMIZE). Plot scan throughput against file size; find where more size stops helping.
+4. **Delta listing:** Delta reads its log by listing the `_delta_log` folder. Check how many log files you have and how checkpoints reduce replay (also read about the experimental fast-listing setting for S3A).
+5. Watch for retry storms and timeouts under load in the RustFS logs.
 
 **Done when:** you have recommended storage settings and a target file size, with evidence.
 
+**Read more:** Hadoop S3A https://hadoop.apache.org/docs/stable/hadoop-aws/tools/hadoop-aws/index.html | S3A performance https://hadoop.apache.org/docs/stable/hadoop-aws/tools/hadoop-aws/performance.html | Delta storage configuration https://docs.delta.io/latest/delta-storage.html
+
 ---
 
-## M6. JDBC concurrency and writes (protecting Postgres)
+## M5. JDBC concurrency (protecting Postgres)
 
-**Objective:** extract and write without hurting the source.
+**Objective:** extract without hurting the source database.
+
+**Why it matters:** each JDBC partition is a database connection and a query. Too many can overload Postgres, and more partitions than cores doesn't make Spark faster, because only as many tasks run at once as there are cores.
 
 **Do, in order:**
 1. **Raise read parallelism step by step** (1, 2, 4, 8, 16, 32). At each step record Postgres active connections, CPU, query latency and Spark time.
 2. Find the point where Postgres hurts or Spark stops improving.
-3. Explain how executors and cores bound the number of simultaneous connections, and which Postgres connection limit applies.
-4. Compare **fetch size** values for executor memory behavior (some drivers buffer the entire result set unless configured).
-5. **Write a gold aggregate back to Postgres:** sweep batch size, the driver's batched-insert rewriting option and write parallelism; observe locks, WAL volume and index maintenance.
-6. Compare writing into an unindexed staging table then swapping, versus writing into the live table.
-7. Write a **backpressure policy:** maximum parallelism, quiet windows, a read replica, or extraction from the change log instead.
+3. Explain how executors and cores bound simultaneous connections, and which Postgres connection limit applies.
+4. Compare fetch size values for executor memory behavior (some drivers buffer the whole result unless configured).
+5. Write a **policy**: maximum parallelism, quiet windows for extraction, or a read replica.
 
-**Done when:** you can state the maximum safe parallelism for each Postgres workload and why.
+**Done when:** you can state the maximum safe parallelism and why.
 
----
-
-## M7. Concurrent writers and commit conflicts
-
-**Objective:** know what happens when two jobs touch the same Iceberg table.
-
-**Do, in order:**
-1. Run two Spark applications against the same table for each scenario:
-
-| Scenario | Expected | Record |
-|---|---|---|
-| two appends at once | both succeed (with retries) | retry counts, commit time |
-| two merges touching the same files | one fails or retries | error text |
-| merge versus compaction | one loses | which and why |
-| append during snapshot expiry | check safety | outcome |
-| write during orphan removal | check safety | outcome |
-
-2. Tune commit retries and the per-operation isolation levels; compare serializable and snapshot isolation behavior.
-3. Verify a failed commit leaves **no visible partial data**; measure orphan files left behind.
-4. Design **write isolation rules** (which jobs may run together, in what order).
-
-**Done when:** you have a table of safe and unsafe job combinations and a rule for scheduling them.
+**Read more:** Spark JDBC https://spark.apache.org/docs/latest/sql-data-sources-jdbc.html | PostgreSQL monitoring statistics https://www.postgresql.org/docs/current/monitoring-stats.html
 
 ---
 
-## M8. Scheduling and dynamic allocation
+## M6. Failures and recovery
 
-**Objective:** share the cluster predictably.
+**Objective:** see how Spark and Delta recover and what they leave behind.
 
-**Do, in order:**
-1. Enable dynamic allocation with shuffle tracking (needed in standalone) and watch executors scale up and down; sweep the idle timeout and bounds.
-2. Run two notebooks (two applications) concurrently; see how standalone shares cores (`spark.cores.max`, spread-out placement).
-3. Inside one session, run two jobs from separate threads under FIFO and FAIR scheduling with pools; measure each job's latency.
-4. Sweep the data-locality wait; decide if it matters when all data comes from RustFS.
+**Concepts:** a Delta commit has two phases: first the data files are written, and only then the log entry that makes them part of the table. If a job dies in between, the table is unchanged (readers never see the new files) but the unreferenced files remain as **orphans** until VACUUM removes them.
 
-**Done when:** you can describe your fair-sharing configuration and the numbers behind it.
-
----
-
-## M9. Resilience: speculation and failures
-
-**Objective:** see how Spark recovers and what it leaves behind.
-
-**Do, in order:**
-1. **Straggler:** create a slow task, enable speculation, tune multiplier and quantile; check whether speculative attempts leave extra files in an Iceberg write.
-2. **Executor loss:** kill a worker container during a long job. Record lost executor, task and stage retries, and the outcome; repeat with different retry limits.
-3. **Storage failure:** stop RustFS mid-write. Record errors, retries, table state, and leftover files.
-4. **Source failure:** stop Postgres mid-extract. Record errors and whether a half-published extract exists.
-5. **Exclusion:** make one task fail deterministically and test failure-based exclusion.
-6. Bring services back; confirm workers re-register and the next run succeeds.
+**Do, in order**, recording a timeline for each:
+1. **Executor loss:** kill a worker container during a long job. Record lost executor, task retries, stage retries, outcome.
+2. **Storage failure:** stop RustFS during a Delta write. Record the error and retries; then confirm the table still reads at its last good version; list leftover data files.
+3. **Source failure:** stop Postgres during an extract. Record the error, and confirm no half-published extract exists (no manifest).
+4. Bring services back; confirm workers re-register and the next run succeeds.
 
 **Done when:** each failure has a recorded timeline and a runbook entry.
 
+**Read more:** Delta concurrency control and ACID https://docs.delta.io/latest/concurrency-control.html | Spark standalone (worker recovery) https://spark.apache.org/docs/latest/spark-standalone.html
+
 ---
 
-## M10. Shuffle internals
+## M7. Delta writer rules (what may run at the same time)
 
-**Objective:** connect UI shuffle numbers with files on disk.
+**Objective:** know which jobs can write the same table together, and design around the limits.
+
+**Concepts:**
+- **OCC (optimistic concurrency):** Delta writers don't take locks. Each reads the latest version, does its work, then tries to commit the next version. If another writer committed something that conflicts, the commit fails with an exception and you retry.
+- **Isolation level:** the default (write-serializable) allows more concurrency; the stricter serializable level detects more conflicts.
+- **The single-writer rule (Gate F):** on S3-style storage, Delta's default commit logic only guarantees correctness when all concurrent writes come from **one Spark driver**. Several separate applications writing the same table can lose data.
 
 **Do, in order:**
-1. Compare shuffle buffer and in-flight fetch settings on a large shuffle.
-2. Point the local directory somewhere specific and inspect shuffle files on a worker during a job.
-3. Relate shuffle write, read, spill and disk bytes in the Stages tab to the files.
-4. Check what happens when local disk fills.
+1. **Inside one application** (two threads in the same session), run these and record the outcome:
 
-**Done when:** you can explain each shuffle metric in terms of files and memory.
+| Scenario | Expected | Record |
+|---|---|---|
+| two appends at the same time | both succeed | commit times |
+| two MERGEs touching overlapping rows | one fails with a conflict exception | the error text |
+| MERGE while OPTIMIZE runs | check which conflicts | outcome |
+
+2. Compare the default and stricter isolation levels on one scenario.
+3. Write **scheduling rules:** which jobs may run together, and a simple **writer lock** so only one application writes a table at a time.
+4. **Optional, scratch table only:** with a throwaway table, try two *separate* applications writing at once to see the failure mode. Never do this on a real table.
+
+**Done when:** you have a table of safe and unsafe job combinations and a scheduling rule.
+
+**Read more:** Delta concurrency control https://docs.delta.io/latest/concurrency-control.html | Delta storage configuration (S3 single vs multi-cluster) https://docs.delta.io/latest/delta-storage.html | Optimistic concurrency control https://en.wikipedia.org/wiki/Optimistic_concurrency_control
 
 ---
 
-## M11. Capacity model
+## Depth (optional)
 
-Produce a document that answers: for each workload class (scan, shuffle, CPU, memory, write), what layout, memory, storage settings and parallelism are best on this platform; where the bottleneck is; what limits Postgres and RustFS; and what you'd change when data doubles. Link each statement to experiment ids.
+- **Serialization and the RDD API:** compare group-by-key, reduce-by-key and a DataFrame aggregation by shuffle bytes; switch the serializer and note why DataFrames barely change.
+- **Scheduling and dynamic allocation:** enable dynamic allocation with shuffle tracking; run two applications at once and see how standalone shares cores; try FIFO and FAIR pools.
+- **Shuffle internals:** inspect shuffle files on a worker during a job; relate shuffle write/read and spill metrics to files.
+- **Speculation:** make one task slow and see whether a speculative copy finishes first.
+
+**Read more:** Job scheduling https://spark.apache.org/docs/latest/job-scheduling.html | Tuning guide https://spark.apache.org/docs/latest/tuning.html
+
+---
+
+## M8. Capacity model
+
+Write a document answering: for each workload class (scan, shuffle, CPU, memory), what layout, memory, storage settings and parallelism work best on this platform; where the bottleneck is; what limits Postgres and RustFS; and what you'd change if the data doubled. Link every statement to experiment ids.
 
 ## Config experiments (summary)
 
 | Area | Knobs |
 |---|---|
 | Topology | executor cores and memory, `spark.cores.max` |
-| Memory | memory fraction, storage fraction, off-heap, GC flags |
-| Python | Arrow settings, worker reuse, worker memory |
-| Object store | S3A pool, threads, buffers, read-ahead, file I/O choice, Iceberg split size |
-| JDBC | partitions, fetch size, batch size, rewrite option |
-| Iceberg | commit retries, isolation, target file size |
-| Scheduling | dynamic allocation, scheduler mode, locality wait |
-| Resilience | speculation, task retries, exclusion |
+| Memory | memory fraction, storage fraction |
+| Python | UDF type (Arrow settings) |
+| Object store | S3A pool, threads, buffers, read-ahead, target file size |
+| JDBC | partitions, fetch size |
+| Delta writes | isolation level, retries |
 
 ## Exit criteria for Project 4
 1. Every workload has a named bottleneck with evidence.
 2. You have safe limits for Postgres and recommended storage settings for RustFS.
-3. You have a written failure runbook.
+3. You have a written failure runbook and writer rules.
