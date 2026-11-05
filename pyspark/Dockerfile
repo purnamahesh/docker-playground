@@ -14,7 +14,7 @@ FROM ubuntu:24.04 AS base
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-         openjdk-25-jre-headless python3 python3-venv ca-certificates \
+         openjdk-25-jre-headless python3 python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
 ENV SPARK_HOME=/opt/spark \
