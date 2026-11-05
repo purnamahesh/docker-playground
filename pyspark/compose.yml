@@ -30,7 +30,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - ./pgdata:/var/lib/postgresql/data
+      - pg-data:/var/lib/postgresql/data
       - ./work_dir/sql/init.sql:/docker-entrypoint-initdb.d/init.sql
       - ./work_dir/data/InstaCart:/tmp/InstaCart
     networks:
@@ -120,3 +120,6 @@ services:
 
 networks:
   spark-network:
+
+volumes:
+  pg-data:

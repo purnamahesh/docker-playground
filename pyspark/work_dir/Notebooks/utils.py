@@ -41,6 +41,14 @@ def createSparkSession(appName: str):
 
     return spark, stagemetrics
 
+def read_csv_from_s3(spark, source_path: str, corrupt_record_name: str = 'bad_record', options: dict = {}, schema = None, header=True):
+    return (
+        spark.read
+        .option('columnNameOfCorruptRecord', corrupt_record_name)
+        .options(**options)
+        .csv(source_path, header=header, schema=schema)
+    )
+
 def write_postgres_table(df, table_name: str, mode: str = 'overwrite', options: dict = {}):
     df.write \
     .format('jdbc') \
