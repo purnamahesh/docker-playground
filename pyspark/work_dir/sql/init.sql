@@ -13,7 +13,7 @@ CREATE TABLE staging.department (
 );
 
 CREATE TABLE staging.products (
-    product_id INTEGER PRIMARY KEY,
+    product_id INTEGER,
     product_name VARCHAR(200) NOT NULL,
     aisle_id SMALLINT REFERENCES staging.aisle(aisle_id),
     department_id SMALLINT REFERENCES staging.department(department_id)
@@ -30,10 +30,11 @@ CREATE TABLE staging.orders (
 );
 
 CREATE TABLE staging.order_products (
-    product_id INTEGER PRIMARY KEY,
     order_id INTEGER REFERENCES staging.orders(order_id),
+    product_id INTEGER REFERENCES staging.products(product_id),
     add_to_cart_order INTEGER,
-    reordered SMALLINT  
+    reordered SMALLINT,
+    PRIMARY KEY(order_id, product_id)
 );
 
 -- COPY aisle(id, aisle)
