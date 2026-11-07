@@ -12,7 +12,7 @@ Turn the raw Instacart files into a governed lakehouse: profile and enrich them 
 
 | Phase | Milestone | Core? | Starts when | Produces |
 |---|---|---|---|---|
-| A | M0 Load, profile, enrich | Core | raw files stored in landing | typed source in Postgres, defect register, rebuilt timeline |
+| A | M0 Load, profile, enrich (and M0b generate synthetic data) | Core | raw files stored in landing | typed source in Postgres, defect register, rebuilt timeline |
 | B | M1 Full extraction | Core | S tier exists in Postgres | landing extracts, manifests |
 | C | M3 Bronze | Core | extraction works | bronze Delta tables |
 | D | M4 Silver | Core | bronze exists | silver, quarantine, SCD2 |
@@ -60,7 +60,7 @@ Work on the **S tier** until each phase works end to end, then re-run on M. Only
 7. **Stage constraints.** Add them in order and record the result of each: primary keys on small tables and on orders, then the composite key on lines; foreign keys from lines to orders and to products; products to aisles and departments. Use "add without validating, then validate" so you can count violations instead of failing. *Good result:* a constraint status table (constraint, result, violation count).
 8. **Verify `reordered`.** Rule: it should be 1 when the same user bought this product in any earlier order. Check against the data and interpret mismatches (wrong rule, or wrong flag?).
 9. **Build the rebuilt timeline.** Follow the design decisions in the README (start date, first order, capped gaps, weekday mismatch). Output a timestamp and a quality flag per order, plus a report of how often the weekday doesn't fit.
-10. **Generate the synthetic tables** in dependency order: users and stores first, then the price book, then totals, then payments, then lifecycle columns, erasures, campaign calendar. Test each with its validity rules.
+10. **Generate the synthetic tables** by following **M0b** below (users and tier history, stores, price book, order totals, payments, lifecycle, injected skew, erasures, campaign calendar), in the dependency order given there. Test each table with its validity rules and write the generation report.
 11. **Add OLTP columns and indexes.** Add `updated_at` and `is_deleted`. Create keys and foreign-key indexes. **Deliberately skip one useful index** (for example on the order timestamp) so Projects 1 to 3 can show its effect.
 12. **Build tiers.** S first (sample by user), then M, later L. Re-profile each tier and compare distributions with M.
 
@@ -93,6 +93,179 @@ Work on the **S tier** until each phase works end to end, then re-run on M. Only
 **Done when:** every table loaded and typed; the defect register has an entry for every issue in README 4.3 (or a note that you didn't find it); constraint table complete; timeline report written; S and M row counts match the files.
 
 **Read more:** PostgreSQL COPY https://www.postgresql.org/docs/current/sql-copy.html | ALTER TABLE (NOT VALID, VALIDATE) https://www.postgresql.org/docs/current/sql-altertable.html | Spark CSV options https://spark.apache.org/docs/latest/sql-data-sources-csv.html | Instacart competition https://www.kaggle.com/c/instacart-market-basket-analysis
+
+---
+
+## M0b. Generating the synthetic data (users, stores, prices, totals, payments, lifecycle)
+
+**Objective:** build the operational tables Instacart doesn't ship with, reproducibly, with documented rules and tests.
+
+**Why it matters:** the real files contain orders, lines and products only. A real grocery platform also has users, stores, prices, payments and order status changes. You create them so later work (SCD2, price joins, reconciliation, incremental loads) has something realistic to chew on. Because the data is invented, **every rule must be written down, seeded and tested**, or you won't be able to tell a pipeline bug from a generator bug.
+
+### Core idea: repeatable randomness (read this first)
+
+Spark's own random function gives different numbers if the data is split into partitions differently, so reruns would not match. Instead, make randomness **a function of the data**:
+
+- For every value that should look random, compute a number between 0 and 1 from a **hash of three things**: the entity's key (for example the user id), a short **purpose label** (for example `tier` or `tip`), and a global **seed**.
+- Same inputs always give the same number, whatever the partitioning and however many times you rerun. A different purpose label gives an independent number for the same entity.
+- To turn that number into a value: for a **category with weights**, compare it with cumulative weights (0.70 free, then 0.25 plus, then 0.05 pro); for a **bell-shaped value**, average four such numbers; for a **long-tailed value** such as price, multiply a base by an exponential of a bell-shaped number.
+
+**Reproducibility test:** build the S tier twice. Every table's row count and column checksums must be identical. Do this before trusting anything else.
+
+### Where to generate and where to store
+
+| Decision | Options | Recommendation |
+|---|---|---|
+| Where to compute | Spark (works on files, scales, hash functions available) / SQL inside Postgres / a plain script | Spark, reading the typed tables from Postgres or landing |
+| How to load into Postgres | Spark JDBC batch write / write CSV then bulk copy | bulk copy for the biggest tables (faster); JDBC write for small ones; compare once |
+| How to make the S tier | generate S directly / generate M then keep ~10% of users | generate for all users, then **filter by sampled users** so every table stays consistent |
+| Indexes | before / after loading | after loading |
+
+### Generation order (each step needs the ones above it)
+
+| Step | Table | Needs |
+|---|---|---|
+| 1 | Rebuilt timeline (done in M0 step 9) | real orders |
+| 2 | Campaign calendar | timeline date range |
+| 3 | Users and membership tier history | timeline (first order per user) |
+| 4 | Stores and per-user store assignment | users |
+| 5 | Price book (with promotions from campaigns) | products, campaigns, timeline range |
+| 6 | Order lines priced at order time and order totals | prices, store, user tier |
+| 7 | Payments | order totals |
+| 8 | Lifecycle columns and substitutions | orders, lines |
+| 9 | Injected skew (bulk buyer, promotional product) | everything above |
+| 10 | Erasure schedule | users, orders |
+
+### Step 2: Campaign calendar
+
+- **Columns:** campaign_id, name, start_date, end_date, discount_percent, scope (all products or one department).
+- **How:** pick 8 to 12 campaigns per year spread over the timeline. Use fixed names (spring sale, summer BBQ, back to school, Black Friday, holiday). Length 5 to 21 days. Discount 5% to 30%. Give about half of them a department scope (for example produce).
+- **Deliberate wrinkle:** allow one or two campaigns to overlap in time. You will later need a rule for which discount wins.
+- **Test:** start before end; no campaign outside the timeline; overlaps only where you planned them.
+
+### Step 3: Users and membership tier history
+
+- **Users table columns:** user_id (the real ids from orders), signup_ts, region, is_deleted, updated_at.
+- **How:**
+  - signup_ts = the user's first order time minus a random 0 to 14 days.
+  - region: weighted choice among about 8 regions (for example 25%, 20%, 15%, 12%, 10%, 8%, 6%, 4%).
+- **Tier history table (SCD2 source) columns:** user_id, tier, valid_from, valid_to.
+  - Initial tier at signup: free 70%, plus 25%, pro 5%.
+  - Upgrades: users with many orders upgrade more often. Rule of thumb: for each user compute the number of orders in the first 90 days; the probability of one upgrade rises with that number (for example 5% for 1 order, 30% for 5 or more). Pick the upgrade date at one of the user's own order dates (by hash).
+  - A small share (about 3%) downgrade one step later.
+  - Build intervals so they do not overlap: valid_to of one row = valid_from of the next; the current row has an open end date.
+- **Example rows (illustrative):**
+
+| user_id | tier | valid_from | valid_to |
+|---|---|---|---|
+| 42 | free | 2025-06-10 | 2026-03-01 |
+| 42 | plus | 2026-03-01 | 9999-12-31 |
+| 77 | pro | 2025-09-02 | 9999-12-31 |
+
+- **Tests:** exactly one current row per user; no overlapping or gapped intervals; first valid_from is not after the first order; tier shares within a point or two of the targets.
+
+### Step 4: Stores and store assignment
+
+- **Stores columns:** store_id, name, type (grocery, club, convenience), region.
+- **How:**
+  - Create about 12 to 30 stores.
+  - Give store i a popularity weight proportional to 1 / i (a long tail). The first store holds roughly a quarter of all orders; this is your **popular store** hot key.
+  - Each user gets a **primary store** by weighted draw (hash of user id) and with 20% probability a **secondary store**.
+  - Each order takes the primary store 80% of the time, otherwise the secondary (decided by a hash of the order id).
+- **Test:** every order has a store; store shares match the weights within a point or two; no user has more than two stores.
+
+### Step 5: Price book
+
+- **Columns:** product_id, price, valid_from, valid_to, is_promo, campaign_id (nullable).
+- **How:**
+  1. **Base price per aisle:** give each aisle a typical price (draw between about 1.50 and 12.00 by hash of the aisle id).
+  2. **Base price per product:** aisle price times a long-tailed factor (some products cheaper, some much dearer); round to cents.
+  3. **Price changes:** for each product draw 0 to 6 change dates across the timeline (by hash) and multiply the price by a factor between 0.90 and 1.15 at each. Each change closes the previous period (valid_to = day before the next valid_from) and opens a new one; the last period is open-ended.
+  4. **Promotions:** for each campaign, give about 30% of the products in scope a promotional price (discount applied) during the campaign dates, marked is_promo.
+- **Deliberate trap:** promotional periods **overlap** the base period of the same product. The rule later (silver, M4) is "promotion beats base price".
+- **Example rows (illustrative):**
+
+| product_id | price | valid_from | valid_to | is_promo |
+|---|---|---|---|---|
+| 24852 | 0.69 | 2025-06-01 | 2026-01-14 | false |
+| 24852 | 0.72 | 2026-01-15 | 9999-12-31 | false |
+| 24852 | 0.59 | 2026-03-01 | 2026-03-14 | true |
+
+- **Tests:** base periods have no gaps or overlaps per product; every price is positive; the earliest valid_from is on or before the earliest order; overlaps exist only where is_promo is true.
+
+### Step 6: Price the lines and compute order totals
+
+- **Line columns to add:** quantity, unit_price, line_total, fulfillment_status (set in step 8).
+- **How:**
+  - quantity: 1 for 85% of lines, 2 for 12%, 3 for 3% (hash of order id and product id).
+  - unit_price: the promotional price if one is valid at the order time, otherwise the base price valid at that time. (This is exactly the rule you will re-implement in Spark later, so keep the generator rule simple and documented.)
+- **Order total columns:** items_total, service_fee, delivery_fee, tip, total.
+  - items_total = sum of line totals.
+  - service_fee = 5% of items_total.
+  - delivery_fee = 0 if items_total is at least 35, or the user is on the pro tier at that time, else 5.99.
+  - tip = 0 for 25% of orders, otherwise 5% to 20% of items_total (hash), rounded to cents.
+  - total = items_total + fees + tip.
+- **Test:** every order's items_total equals the sum of its line totals to the cent; totals are never negative; no order without lines has a nonzero total (test-set orders have no lines, so give them a null total instead).
+
+### Step 7: Payments
+
+- **Columns:** payment_id, order_id, sequence, method, amount, status, paid_at.
+- **How:**
+  - Number of tenders: one card payment for 80% of orders; card plus gift credit for 15%; two cards for 5%.
+  - Split amounts so they add up exactly: draw the first amount, and let the **last tender take the remainder**.
+  - Status: captured for 97%; for 2.5% a first attempt **failed** and a second attempt captured (two rows); for 0.5% a partial **refund** row follows the captured payment.
+  - paid_at: shortly after the order is accepted (step 8).
+- **Injected defects (for the reconciliation lab, record each in the defect register):** about 0.2% of orders have captured payments that miss the total by a few cents; about 0.05% have no payment at all.
+- **Tests:** for every order without an injected defect, captured amounts minus refunds equal the total; every order with a total has at least one payment attempt.
+
+### Step 8: Order lifecycle and substitutions
+
+- **Order columns to add:** status, placed_ts, accepted_ts, picking_started_ts, delivered_ts, cancelled_ts, updated_at.
+- **State machine:** placed -> accepted -> picking -> delivered. About 3% of orders are cancelled, mostly before picking.
+- **Durations (starting values):**
+
+| Stage | Duration |
+|---|---|
+| placed to accepted | about 2 to 5 minutes, long-tailed |
+| accepted to picking | about 5 to 20 minutes |
+| picking | about 1.5 minutes per line plus noise |
+| picking to delivered | about 30 to 90 minutes |
+
+- **Substitutions:** for about 4% of lines set fulfillment_status to substituted and record the replacement product (from the same aisle); for 1.5% set it to out_of_stock (line removed from the total).
+- **Late changes:** for about 2% of delivered orders create a **later** change one to three days after delivery (for example a tip adjustment or a corrected substitution). These are what break naive watermark extraction.
+- **Important: two different timestamps.** The lifecycle times above are the **business times** (when things happened in the story). The column `updated_at` must be the **wall-clock time at which the simulator actually changed the row in Postgres**, because that is what your incremental extraction watches.
+- **How the simulator uses this:**
+  1. Initial load: all orders up to a cutoff date, in their final state (delivered, cancelled).
+  2. Replay window: the remaining days. Insert each order as placed at its business time, then apply each transition as an update at its business time, with the clock compressed (for example one simulated hour per real second). Each change sets `updated_at` to the real current time.
+- **Tests:** timestamps are increasing within an order; status always follows a legal transition; every substituted line has a replacement; cancelled orders have no delivered_ts.
+
+### Step 9: Injected skew
+
+- **Bulk buyer:** pick a new, unused user id. Choose about 5% of orders at random (by hash), **clone** each (new order id, new line rows, shifted time) and assign the clones to the bulk buyer. Rebuild that user's order numbers in time order. Cloning avoids breaking real users' histories.
+- **Promotional product:** choose one product. For about 10% of orders (by hash) add one extra line for it, with the next add-to-cart position.
+- **Popular store:** already created in step 4.
+- **Test:** the bulk buyer holds about 5% of orders, the promotional product appears in about 10% of orders, and no other user's order-number sequence changed.
+
+### Step 10: Erasure requests
+
+- **How:** each replay week choose a few users (a very small share, for example 20 per week). For 70% of them **anonymize**: set is_deleted, null the region, bump updated_at. For 30% **hard delete**: remove the user row and, in the same transaction, the user's orders and lines.
+- **Why:** anonymization is visible to a watermark; hard deletion is not, which is exactly what M2's delete detection must catch.
+- **Test:** after each erasure no orphaned lines remain; the list of deleted keys is written to a side file so you can check what your pipeline should have noticed.
+
+### Generation report (deliverable)
+
+Produce one page after each build with: row counts per table; checks passed and failed; the injected-defect counts (payment mismatches, missing payments, late updates, substitutions, cancellations); the reproducibility test result; and the seed used.
+
+**Traps:**
+- Using Spark's random function directly (reruns differ).
+- Forgetting that `updated_at` must be wall-clock time, not business time.
+- Cloning bulk-buyer orders by moving real users' orders (breaks their histories).
+- Generating prices that leave gaps in coverage, so some lines can't be priced.
+- Changing a rule after you've profiled downstream data without re-running the whole chain.
+
+**Done when:** all tables exist at S and M; the reproducibility test passes; every validity test passes; the generation report lists every injected defect with counts, and each appears in the defect register.
+
+**Read more:** Spark built-in hash and math functions https://spark.apache.org/docs/latest/api/sql/index.html | PostgreSQL COPY https://www.postgresql.org/docs/current/sql-copy.html | Slowly changing dimensions https://en.wikipedia.org/wiki/Slowly_changing_dimension
 
 ---
 
