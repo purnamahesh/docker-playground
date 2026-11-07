@@ -17,6 +17,11 @@ services:
       - RUSTFS_OBS_LOG_DIRECTORY=/logs/
     networks:
       - spark-network
+    deploy:
+      resources:
+        limits:
+          cpus: 2
+          memory: 1G
 
   instacart:
     image: postgres:16
@@ -35,6 +40,11 @@ services:
       - ./work_dir/data/InstaCart:/tmp/InstaCart
     networks:
       - spark-network
+    deploy:
+      resources:
+        limits:
+          cpus: 2
+          memory: 1G
     
   spark-master:
     build:
@@ -53,6 +63,11 @@ services:
       - ./spark-events:/tmp/spark-events
     networks:
       - spark-network
+    deploy:
+      resources:
+        limits:
+          cpus: 2
+          memory: 1G
     # depends_on:
     #   - db
   
@@ -69,13 +84,18 @@ services:
       - ./work_dir:/home/ubuntu/work_dir
       - ./spark-events:/tmp/spark-events
     environment:
-      - SPARK_WORKER_CORES=3
+      - SPARK_WORKER_CORES=2
       - SPARK_WORKER_DIR=/tmp/spark-work
-      - SPARK_WORKER_MEMORY=3g
+      - SPARK_WORKER_MEMORY=2g
     networks:
       - spark-network
     depends_on:
       - spark-master
+    deploy:
+      resources:
+        limits:
+          cpus: 2
+          memory: 2.5G
 
   spark-history-server:
     build:
@@ -94,6 +114,11 @@ services:
       - ./spark-events:/tmp/spark-events
     networks:
       - spark-network
+    deploy:
+      resources:
+        limits:
+          cpus: 1
+          memory: 0.5G
     depends_on:
       - spark-master
 
@@ -117,6 +142,11 @@ services:
       - spark-network
     depends_on:
       - spark-master
+    deploy:
+      resources:
+        limits:
+          cpus: 2
+          memory: 1G
 
 networks:
   spark-network:
